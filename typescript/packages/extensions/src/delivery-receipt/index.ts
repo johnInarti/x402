@@ -41,6 +41,7 @@ export {
   SETTLE_INFO_SCHEMA,
   buildDeclarationInfo,
   buildReceiptPayload,
+  publicResourceUrl,
   signDeliveryReceipt,
   createDeliveryReceiptExtension,
   declareDeliveryReceiptExtension,

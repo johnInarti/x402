@@ -120,7 +120,7 @@ A receipt MUST NOT be returned for a failed settle (`success: false`).
 |---|---|---|---|
 | `version` | integer | Yes | `1` |
 | `issuer` | string | Yes | Same value as the declaration. |
-| `resourceUrl` | string | Yes | Absolute URL of the paid resource as requested. |
+| `resourceUrl` | string | Yes | Absolute URL of the paid resource as the client requested it. A server behind a TLS-terminating proxy MUST sign the client-facing scheme and port (e.g. by rebasing the request path on `issuer` when the host matches). |
 | `method` | string | Yes | Upper-case HTTP method of the paid request. |
 | `scheme` | string | Yes | Payment scheme of the accepted requirements (e.g. `exact`). |
 | `network` | string | Yes | CAIP-2 network of the settlement (e.g. `eip155:8453`). |

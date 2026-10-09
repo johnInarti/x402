@@ -124,6 +124,20 @@ function readPaymentId(extensions: unknown): string | null {
 }
 
 /**
+ * Rebases a request URL on the issuer origin when both name the same host, so a server behind a
+ * TLS-terminating proxy (which sees http://) still signs the URL the client requested (§5.2).
+ *
+ * @param url - URL reported by the HTTP adapter
+ * @param issuer - Issuer origin
+ * @returns The URL as seen by the client
+ */
+export function publicResourceUrl(url: string, issuer: string): string {
+  const u = new URL(url);
+  const i = new URL(issuer);
+  return u.hostname === i.hostname ? `${i.origin}${u.pathname}${u.search}` : u.toString();
+}
+
+/**
  * Builds the unsigned receipt payload from a settle context. Returns null when a receipt must
  * not be issued (failed settle, no body, missing facts).
  *
@@ -151,7 +165,7 @@ export async function buildReceiptPayload(
   return {
     version: 1,
     issuer,
-    resourceUrl: request.adapter.getUrl(),
+    resourceUrl: publicResourceUrl(request.adapter.getUrl(), issuer),
     method: (request.method || request.adapter.getMethod()).toUpperCase(),
     scheme: requirements.scheme,
     network: result.network,

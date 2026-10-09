@@ -317,6 +317,19 @@ describe("delivery-receipt: server extension", () => {
     });
   });
 
+  it("signs the client-facing URL when the server sits behind a TLS-terminating proxy", async () => {
+    const receipt = await issue(
+      settleContext({
+        transportContext: transport(BODY, "http://api.example.com/premium-data?q=1"),
+      }),
+    );
+    expect(receipt.payload.resourceUrl).toBe(`${RESOURCE}?q=1`);
+    const foreign = await issue(
+      settleContext({ transportContext: transport(BODY, "http://other.example/premium-data") }),
+    );
+    expect(foreign.payload.resourceUrl).toBe("http://other.example/premium-data");
+  });
+
   it("issues nothing for failed settles, before-handler settles or missing bodies", async () => {
     expect(
       await createDeliveryReceiptExtension({

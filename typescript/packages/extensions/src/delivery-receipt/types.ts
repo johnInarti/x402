@@ -1,7 +1,7 @@
 /**
  * Types for the x402 delivery-receipt extension.
  *
- * Spec: specs/extensions/delivery-receipt.md
+ * Spec: specs/extensions/delivery-receipt.md (draft v0.2)
  */
 
 /** Extension identifier (key under `extensions`). */
@@ -13,6 +13,12 @@ export const RECEIPT_DOMAIN = "x402-delivery-receipt/1";
 /** Key directory format identifier and signed-message prefix (§7.2). */
 export const KEY_DIRECTORY_SPEC = "x402-receipt-key-directory/1";
 
+/** Domain string that seeds the running digest of a stream (§5.6). */
+export const STREAM_DOMAIN = "x402-delivery-stream/1";
+
+/** SSE event type of the terminal frame that carries the stream trailer and receipt (§5.6). */
+export const STREAM_TRAILER_EVENT = "x402-delivery-receipt";
+
 /** Required `use` of a receipt-signing key in the directory (§7.2). */
 export const RECEIPT_KEY_USE = "x402-delivery-receipt";
 
@@ -22,16 +28,53 @@ export const KEY_DIRECTORY_WELL_KNOWN_PATH = "/.well-known/x402-receipt-keys";
 /** Algorithms registered in §6. */
 export type ReceiptAlgorithm = "ml-dsa-65" | "ml-dsa-87" | "ed25519";
 
+/** Algorithm of the in-session verification path (§6.1). */
+export const SESSION_ALGORITHM = "ed25519" as const;
+
+/** Algorithm of the archival / offline verification path (§6.1). */
+export const ARCHIVAL_ALGORITHM = "ml-dsa-65" as const;
+
+/**
+ * Verification path (§8.1): `session` checks the Ed25519 signature (WebCrypto-friendly);
+ * `archival` checks the ML-DSA-65 signature and is the only path that yields long-term evidence.
+ */
+export type VerificationPath = "session" | "archival";
+
 /** `PaymentRequired.extensions["delivery-receipt"].info` (§4). */
 export interface DeliveryReceiptDeclarationInfo {
   version: 1;
   issuer: string;
+  /** Stable directory URL; per-epoch archives live at `${keyDirectory}/epoch/<n>` (§7.1). */
   keyDirectory: string;
+  /** MUST include `ed25519` and `ml-dsa-65`. */
   algorithms: ReceiptAlgorithm[];
-  delivery?: "inline" | "reference";
+  /** What the receipt commits to (§5.4, §5.6). Default `body`. */
+  deliveryMode?: "body" | "stream";
+  /** Where the receipt travels (§5.5). Default `inline`. */
+  receiptTransport?: "inline" | "reference";
 }
 
-/** Receipt payload, version 1 (§5.2). Every field is always present. */
+/** Delivery commitment for a buffered response body (§5.4). */
+export interface BodyDelivery {
+  mode: "body";
+  /** Lowercase hex SHA-256 of the identity-coded body octets. */
+  sha256: string;
+}
+
+/** Delivery commitment for a stream of frames (§5.6). */
+export interface StreamDelivery {
+  mode: "stream";
+  /** How the response was cut into frames. Registered: `sse`. */
+  framing: string;
+  /** Number of frames hashed (the terminal frame is not counted). */
+  frameCount: number;
+  /** Lowercase hex running digest after the last frame. */
+  digest: string;
+}
+
+export type DeliveryCommitment = BodyDelivery | StreamDelivery;
+
+/** Receipt payload, version 1 as defined by draft v0.2 (§5.2). Every field is always present. */
 export interface DeliveryReceiptPayload {
   version: 1;
   issuer: string;
@@ -47,24 +90,40 @@ export interface DeliveryReceiptPayload {
   logIndex: number | null;
   paymentId: string | null;
   responseStatus: number | null;
-  responseSha256: string;
   responseContentType: string | null;
+  delivery: DeliveryCommitment;
+  /** Epoch of the key directory in force at `issuedAt`. */
+  keyDirectoryEpoch: number;
+  /** `root` of that directory epoch: SHA-256 of its canonical content (§7.2). */
+  keyDirectoryDigest: string;
   issuedAt: number;
+}
+
+/** One signature over the receipt message (§5.3). */
+export interface ReceiptSignature {
+  alg: ReceiptAlgorithm;
+  kid: string;
+  /** Canonical base64 signature over `RECEIPT_DOMAIN + "\n" + receiptId`. */
+  signature: string;
 }
 
 /** Wire object (§5.3). */
 export interface DeliveryReceipt {
-  alg: ReceiptAlgorithm;
-  kid: string;
   payload: DeliveryReceiptPayload;
-  /** Canonical base64 signature over `RECEIPT_DOMAIN + "\n" + receiptId`. */
-  signature: string;
+  /** 2–4 entries, distinct `alg`, MUST include `ed25519` and `ml-dsa-65`. */
+  signatures: ReceiptSignature[];
 }
 
 /** Settle-response `info` (§5.1 / §5.5). */
 export type DeliveryReceiptSettleInfo =
   | { receipt: DeliveryReceipt }
   | { receiptId: string; receiptUrl: string };
+
+/** Data of the terminal SSE frame of a stream (§5.6). */
+export type StreamTrailer = { frameCount: number; digest: string } & (
+  | { receipt: DeliveryReceipt }
+  | { receiptId: string; receiptUrl: string }
+);
 
 export type KeyStatus = "reserved" | "active" | "retiring" | "retired" | "revoked";
 
@@ -80,16 +139,30 @@ export interface KeyDirectoryEntry {
   revokedAt: number | null;
 }
 
-/** Signed key directory (§7.2). */
+/** Governance key of a directory (§7.2). */
+export interface GovernanceKey {
+  alg: ReceiptAlgorithm;
+  publicKey: string;
+}
+
+/** Signature of a directory by one of its governance keys (§7.2). */
+export interface DirectorySignature {
+  alg: ReceiptAlgorithm;
+  signature: string;
+}
+
+/** Signed key directory, one epoch (§7.2). */
 export interface KeyDirectory {
   spec: typeof KEY_DIRECTORY_SPEC;
   issuer: string;
   epoch: number;
   prevRoot: string;
-  governanceKey: { alg: ReceiptAlgorithm; publicKey: string };
+  /** Unix seconds from which this epoch is in force. */
+  publishedAt: number;
+  governanceKeys: GovernanceKey[];
   keys: KeyDirectoryEntry[];
   root: string;
-  signature: string;
+  signatures: DirectorySignature[];
 }
 
 /**
@@ -112,11 +185,23 @@ export interface ReceiptVerificationLevels {
 }
 
 export interface ReceiptVerificationResult {
-  /** True only when every level that was requested passed. */
+  /** True only when every level that was evaluated passed. */
   valid: boolean;
+  /** Which signature path was verified (§8.1). */
+  path: VerificationPath;
+  /**
+   * True only for the archival path with `authentic` and `trusted` passing: the result can be
+   * kept as long-term evidence. Always false on the session path.
+   */
+  longTermEvidence: boolean;
+  /** Algorithms whose signatures were verified, with the engine used. */
+  signaturesVerified: { alg: ReceiptAlgorithm; kid: string; engine: string }[];
   levels: ReceiptVerificationLevels;
   receiptId: string | null;
   /** How the directory's governance key was trusted. */
   trustBasis: "pinned" | "tls" | "none";
+  /** Directory epoch the receipt was issued under, and the latest epoch it was chained to. */
+  directoryEpoch: number | null;
+  latestDirectoryEpoch: number | null;
   reasons: { level: keyof ReceiptVerificationLevels; code: string; detail?: string }[];
 }

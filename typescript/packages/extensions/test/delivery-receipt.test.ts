@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, vi } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 import { x402ResourceServer } from "@x402/core/server";
 import {
   encodePaymentResponseHeader,
@@ -16,31 +17,55 @@ import type {
 import {
   DELIVERY_RECEIPT,
   RECEIPT_KEY_USE,
+  STREAM_TRAILER_EVENT,
   activeKeyEntry,
   buildKeyDirectory,
   canonicalJson,
   computeReceiptId,
+  computeStreamDigest,
   createDeliveryReceiptExtension,
   createLocalReceiptSigner,
+  createReceiptPayload,
+  createSseReceiptWriter,
   declareDeliveryReceiptExtension,
   extractDeliveryReceipt,
+  fetchKeyDirectoryChain,
+  formatSseEvent,
   fromCanonicalBase64,
   generateReceiptKeyPair,
   getDeliveryReceiptResult,
   keyAuthorizationError,
+  keyDirectoryEpochUrl,
+  offerReceiptFacts,
+  parseSse,
+  receiptSignedMessage,
   resolveDeliveryReceipt,
   sha256Hex,
   signDeliveryReceipt,
   verifyDeliveryReceipt,
   verifyKeyDirectory,
+  verifyKeyDirectoryChain,
+  verifySseDelivery,
   withDeliveryReceipts,
   type DeliveryReceipt,
+  type DeliveryReceiptServerConfig,
   type KeyDirectory,
+  type KeyDirectoryEntry,
   type ReceiptKeyPair,
+  type ReceiptSigner,
+  type StreamTrailer,
 } from "../src/delivery-receipt";
+import {
+  OFFER_RECEIPT,
+  createJWSOfferReceiptIssuer,
+  createOfferReceiptExtension,
+  declareOfferReceiptExtension,
+} from "../src/offer-receipt";
+import { createES256Signer, generateES256KeyPair } from "./offer-receipt-test-utils";
 
 const ISSUER = "https://api.example.com";
 const RESOURCE = `${ISSUER}/premium-data`;
+const DIR_URL = `${ISSUER}/.well-known/x402-receipt-keys`;
 const NOW = 1_790_473_960;
 const BODY = new TextEncoder().encode(JSON.stringify({ price: "64012.55", source: "example" }));
 
@@ -63,9 +88,15 @@ const settle: SettleResponse = {
 
 const seed = (n: number) => new Uint8Array(32).fill(n);
 
-let governance: ReceiptKeyPair;
-let receiptKey: ReceiptKeyPair;
+let govEd: ReceiptKeyPair;
+let govPq: ReceiptKeyPair;
+let keyEd: ReceiptKeyPair;
+let keyPq: ReceiptKeyPair;
 let directory: KeyDirectory;
+let signers: ReceiptSigner[];
+
+const pinnedPq = () => ({ pinnedGovernanceKeys: [govPq.publicKeyB64] });
+const pinnedBoth = () => ({ pinnedGovernanceKeys: [govEd.publicKeyB64, govPq.publicKeyB64] });
 
 /**
  * Builds a transport context the way the HTTP middlewares do after buffering the body.
@@ -117,17 +148,27 @@ function settleContext(overrides: Partial<SettleResultContext> = {}): SettleResu
 }
 
 /**
+ * Server configuration with the baseline signer pair and the epoch-1 directory.
+ *
+ * @param overrides - Fields to override
+ * @returns Configuration
+ */
+function config(overrides: Partial<DeliveryReceiptServerConfig> = {}): DeliveryReceiptServerConfig {
+  return { issuer: ISSUER, signers, directory, now: () => NOW, ...overrides };
+}
+
+/**
  * Issues a receipt through the extension hook.
  *
  * @param ctx - Settle context
+ * @param overrides - Config overrides
  * @returns The receipt
  */
-async function issue(ctx: SettleResultContext = settleContext()): Promise<DeliveryReceipt> {
-  const ext = createDeliveryReceiptExtension({
-    issuer: ISSUER,
-    signer: createLocalReceiptSigner(receiptKey),
-    now: () => NOW,
-  });
+async function issue(
+  ctx: SettleResultContext = settleContext(),
+  overrides: Partial<DeliveryReceiptServerConfig> = {},
+): Promise<DeliveryReceipt> {
+  const ext = createDeliveryReceiptExtension(config(overrides));
   const out = (await ext.enrichSettlementResponse!({}, ctx)) as {
     info: { receipt: DeliveryReceipt };
   };
@@ -135,14 +176,25 @@ async function issue(ctx: SettleResultContext = settleContext()): Promise<Delive
 }
 
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+const sigOf = (r: DeliveryReceipt, alg: string) => r.signatures.find(s => s.alg === alg)!;
+const flip = (b64: string, i = 10) => {
+  const bytes = fromCanonicalBase64(b64)!;
+  bytes[i] ^= 0xff;
+  return Buffer.from(bytes).toString("base64");
+};
+const codes = (v: { reasons: { code: string }[] }) => v.reasons.map(r => r.code);
 
 beforeAll(async () => {
-  governance = await generateReceiptKeyPair("ml-dsa-65", seed(1));
-  receiptKey = await generateReceiptKeyPair("ml-dsa-65", seed(2));
+  govEd = await generateReceiptKeyPair("ed25519", seed(1));
+  govPq = await generateReceiptKeyPair("ml-dsa-65", seed(1));
+  keyEd = await generateReceiptKeyPair("ed25519", seed(2));
+  keyPq = await generateReceiptKeyPair("ml-dsa-65", seed(2));
+  signers = [createLocalReceiptSigner(keyEd), createLocalReceiptSigner(keyPq)];
   directory = await buildKeyDirectory({
     issuer: ISSUER,
-    governance,
-    keys: [activeKeyEntry(receiptKey, NOW - 86_400)],
+    publishedAt: NOW - 86_400,
+    governance: [govEd, govPq],
+    keys: [activeKeyEntry(keyEd, NOW - 86_400), activeKeyEntry(keyPq, NOW - 86_400)],
   });
 });
 
@@ -161,17 +213,91 @@ describe("delivery-receipt: encoding", () => {
     expect(fromCanonicalBase64("AAF=")).toBeNull(); // non-zero pad bits
     expect(fromCanonicalBase64(42)).toBeNull();
   });
+
+  it("signs the 64-character hex text of the receipt id, not the raw digest", async () => {
+    const receipt = await issue();
+    const id = await computeReceiptId(receipt.payload);
+    const msg = receiptSignedMessage(id);
+    expect(new TextDecoder().decode(msg)).toBe(`x402-delivery-receipt/1\n${id}`);
+    expect(msg.length).toBe(24 + 64);
+    const ed = fromCanonicalBase64(sigOf(receipt, "ed25519").signature)!;
+    expect(ed25519.verify(ed, msg, keyEd.publicKey)).toBe(true);
+    // The other reading of the issue text (domain line + raw 32-byte digest) must not verify.
+    const raw = new Uint8Array([
+      ...new TextEncoder().encode("x402-delivery-receipt/1\n"),
+      ...Buffer.from(id, "hex"),
+    ]);
+    expect(ed25519.verify(ed, raw, keyEd.publicKey)).toBe(false);
+  });
+});
+
+describe("delivery-receipt: stream digest", () => {
+  it("chains frames in order with a length prefix", async () => {
+    const empty = await computeStreamDigest([]);
+    expect(empty).toEqual({
+      frameCount: 0,
+      digest: await sha256Hex("x402-delivery-stream/1"),
+    });
+    const a = await computeStreamDigest(["ab", "c"]);
+    const b = await computeStreamDigest(["a", "bc"]);
+    const c = await computeStreamDigest(["c", "ab"]);
+    expect(a.frameCount).toBe(2);
+    expect(new Set([a.digest, b.digest, c.digest]).size).toBe(3);
+  });
+
+  it("parses SSE the way EventSource dispatches it", () => {
+    const text = `: comment\nretry: 10\n\nevent: tick\nid: 1\ndata: line1\ndata: line2\n\ndata:x\r\n\r\n`;
+    expect(parseSse(text)).toEqual([
+      { event: "tick", data: "line1\nline2", id: "1" },
+      { event: "message", data: "x", id: "1" },
+    ]);
+    expect(formatSseEvent("a\nb", "e")).toBe("event: e\ndata: a\ndata: b\n\n");
+  });
 });
 
 describe("delivery-receipt: key directory", () => {
-  it("verifies a freshly built directory (tls and pinned)", async () => {
-    const tls = await verifyKeyDirectory(directory, { expectedIssuer: ISSUER });
-    expect(tls).toMatchObject({ ok: true, trustBasis: "tls" });
-    const pinned = await verifyKeyDirectory(directory, {
+  it("verifies a freshly built directory on both paths (tls and pinned)", async () => {
+    for (const path of ["session", "archival"] as const) {
+      const tls = await verifyKeyDirectory(directory, { expectedIssuer: ISSUER, path });
+      expect(tls, path).toMatchObject({ ok: true, trustBasis: "tls" });
+      const pinned = await verifyKeyDirectory(directory, {
+        expectedIssuer: ISSUER,
+        path,
+        ...pinnedBoth(),
+      });
+      expect(pinned, path).toMatchObject({ ok: true, trustBasis: "pinned" });
+    }
+  });
+
+  it("pins only the governance key whose signature was verified on the path", async () => {
+    // Pinning the ML-DSA governance key does not vouch for an Ed25519 signature.
+    const r = await verifyKeyDirectory(directory, {
       expectedIssuer: ISSUER,
-      pinnedGovernanceKeys: [governance.publicKeyB64],
+      path: "session",
+      ...pinnedPq(),
     });
-    expect(pinned).toMatchObject({ ok: true, trustBasis: "pinned" });
+    expect(r.code).toBe("DIRECTORY_SIGNER_NOT_PINNED");
+  });
+
+  it("checks each governance signature on its own path", async () => {
+    const badPq = clone(directory);
+    badPq.signatures = badPq.signatures.map(s =>
+      s.alg === "ml-dsa-65" ? { ...s, signature: flip(s.signature) } : s,
+    );
+    expect((await verifyKeyDirectory(badPq, { expectedIssuer: ISSUER, path: "session" })).ok).toBe(
+      true,
+    );
+    expect((await verifyKeyDirectory(badPq, { expectedIssuer: ISSUER })).code).toBe(
+      "DIRECTORY_SIGNATURE_INVALID",
+    );
+  });
+
+  it("requires both governance algorithms", async () => {
+    const one = clone(directory);
+    one.governanceKeys = one.governanceKeys.filter(g => g.alg === "ml-dsa-65");
+    expect((await verifyKeyDirectory(one, { expectedIssuer: ISSUER })).detail).toBe(
+      "governanceKeys",
+    );
   });
 
   it("rejects a tampered directory, a foreign issuer and an unpinned governance key", async () => {
@@ -183,57 +309,31 @@ describe("delivery-receipt: key directory", () => {
     expect(
       (await verifyKeyDirectory(directory, { expectedIssuer: "https://evil.example" })).code,
     ).toBe("DIRECTORY_ISSUER_MISMATCH");
-    const other = await generateReceiptKeyPair("ml-dsa-65", seed(9));
     const forged = await buildKeyDirectory({
       issuer: ISSUER,
-      governance: other,
-      keys: [activeKeyEntry(receiptKey, NOW - 10)],
+      publishedAt: NOW - 10,
+      governance: [
+        await generateReceiptKeyPair("ed25519", seed(9)),
+        await generateReceiptKeyPair("ml-dsa-65", seed(9)),
+      ],
+      keys: [activeKeyEntry(keyEd, NOW - 10), activeKeyEntry(keyPq, NOW - 10)],
     });
-    expect(
-      (
-        await verifyKeyDirectory(forged, {
-          expectedIssuer: ISSUER,
-          pinnedGovernanceKeys: [governance.publicKeyB64],
-        })
-      ).code,
-    ).toBe("DIRECTORY_SIGNER_NOT_PINNED");
+    expect((await verifyKeyDirectory(forged, { expectedIssuer: ISSUER, ...pinnedPq() })).code).toBe(
+      "DIRECTORY_SIGNER_NOT_PINNED",
+    );
     expect(
       (await verifyKeyDirectory(forged, { expectedIssuer: ISSUER, requirePinned: true })).code,
     ).toBe("DIRECTORY_SIGNER_NOT_PINNED");
-    const badSig = clone(directory);
-    badSig.signature = forged.signature;
-    expect((await verifyKeyDirectory(badSig, { expectedIssuer: ISSUER })).code).toBe(
-      "DIRECTORY_SIGNATURE_INVALID",
-    );
-  });
-
-  it("detects rollback and equivocation, and malformed input", async () => {
-    expect(
-      (
-        await verifyKeyDirectory(directory, {
-          expectedIssuer: ISSUER,
-          previous: { epoch: 2, root: "a".repeat(64) },
-        })
-      ).code,
-    ).toBe("DIRECTORY_ROLLBACK");
-    expect(
-      (
-        await verifyKeyDirectory(directory, {
-          expectedIssuer: ISSUER,
-          previous: { epoch: 1, root: "a".repeat(64) },
-        })
-      ).code,
-    ).toBe("DIRECTORY_EQUIVOCATION");
-    expect((await verifyKeyDirectory(null, { expectedIssuer: ISSUER })).ok).toBe(false);
     const listedGov = clone(directory);
-    listedGov.keys.push({ ...activeKeyEntry(governance, 0) });
+    listedGov.keys.push(activeKeyEntry(govPq, 0));
     expect((await verifyKeyDirectory(listedGov, { expectedIssuer: ISSUER })).detail).toBe(
       "governance key listed",
     );
+    expect((await verifyKeyDirectory(null, { expectedIssuer: ISSUER })).ok).toBe(false);
   });
 
   it("applies the key lifecycle at issuedAt", () => {
-    const e = activeKeyEntry(receiptKey, 100);
+    const e = activeKeyEntry(keyPq, 100);
     expect(keyAuthorizationError(e, "ml-dsa-65", 150, 200)).toBeNull();
     expect(keyAuthorizationError(e, "ml-dsa-65", 50, 200)).toBe("KEY_NOT_YET_VALID");
     expect(keyAuthorizationError(e, "ed25519", 150, 200)).toBe("KEY_ALG_MISMATCH");
@@ -256,33 +356,227 @@ describe("delivery-receipt: key directory", () => {
   });
 });
 
+describe("delivery-receipt: directory epochs and chaining", () => {
+  let e2: KeyDirectory;
+  let e3: KeyDirectory;
+  let keyPq2: ReceiptKeyPair;
+  const T2 = NOW + 1000;
+  const T3 = NOW + 2000;
+  const retiring = (k: ReceiptKeyPair, until: number): KeyDirectoryEntry => ({
+    ...activeKeyEntry(k, NOW - 86_400),
+    status: "retiring",
+    notAfter: until,
+  });
+
+  beforeAll(async () => {
+    keyPq2 = await generateReceiptKeyPair("ml-dsa-65", seed(4));
+    // Epoch 2 adds a new ML-DSA key and retires the first one at T2.
+    e2 = await buildKeyDirectory({
+      issuer: ISSUER,
+      epoch: 2,
+      prevRoot: directory.root,
+      publishedAt: T2,
+      governance: [govEd, govPq],
+      keys: [activeKeyEntry(keyEd, NOW - 86_400), retiring(keyPq, T2), activeKeyEntry(keyPq2, T2)],
+    });
+    e3 = await buildKeyDirectory({
+      issuer: ISSUER,
+      epoch: 3,
+      prevRoot: e2.root,
+      publishedAt: T3,
+      governance: [govEd, govPq],
+      keys: [
+        activeKeyEntry(keyEd, NOW - 86_400),
+        { ...retiring(keyPq, T2), status: "retired" },
+        activeKeyEntry(keyPq2, T2),
+      ],
+    });
+  });
+
+  it("binds the epoch and digest of the directory in force", async () => {
+    const r = await issue();
+    expect(r.payload.keyDirectoryEpoch).toBe(1);
+    expect(r.payload.keyDirectoryDigest).toBe(directory.root);
+  });
+
+  it("verifies an old receipt against archives chained to the current directory (tls)", async () => {
+    const r = await issue();
+    const v = await verifyDeliveryReceipt(r, { directories: [e3, directory, e2], now: T3 + 10 });
+    expect(v.reasons).toEqual([]);
+    expect(v).toMatchObject({
+      valid: true,
+      trustBasis: "tls",
+      directoryEpoch: 1,
+      latestDirectoryEpoch: 3,
+    });
+  });
+
+  it("refuses a gap in the chain under tls trust, but accepts a pinned saved copy", async () => {
+    const r = await issue();
+    const gap = await verifyDeliveryReceipt(r, { directories: [directory, e3], now: T3 + 10 });
+    expect(codes(gap)).toContain("DIRECTORY_CHAIN_BROKEN");
+    const pinned = await verifyDeliveryReceipt(r, {
+      directory,
+      directoryTrust: pinnedPq(),
+      now: T3 + 10,
+    });
+    expect(pinned.valid).toBe(true);
+    expect(pinned.longTermEvidence).toBe(true);
+  });
+
+  it("detects a broken link, a dropped key and a status regression", async () => {
+    const r = await issue();
+    const fakePrev = await buildKeyDirectory({
+      issuer: ISSUER,
+      epoch: 2,
+      prevRoot: "ab".repeat(32),
+      publishedAt: T2,
+      governance: [govEd, govPq],
+      keys: [activeKeyEntry(keyEd, NOW - 86_400), retiring(keyPq, T2)],
+    });
+    expect(
+      codes(await verifyDeliveryReceipt(r, { directories: [directory, fakePrev], now: T2 })),
+    ).toContain("DIRECTORY_CHAIN_BROKEN");
+    const dropped = await buildKeyDirectory({
+      issuer: ISSUER,
+      epoch: 2,
+      prevRoot: directory.root,
+      publishedAt: T2,
+      governance: [govEd, govPq],
+      keys: [activeKeyEntry(keyEd, NOW - 86_400)],
+    });
+    expect(
+      codes(await verifyDeliveryReceipt(r, { directories: [directory, dropped], now: T2 })),
+    ).toContain("DIRECTORY_CHAIN_KEY_DROPPED");
+    const regressed = await buildKeyDirectory({
+      issuer: ISSUER,
+      epoch: 4,
+      prevRoot: e3.root,
+      publishedAt: T3,
+      governance: [govEd, govPq],
+      keys: [
+        activeKeyEntry(keyEd, NOW - 86_400),
+        activeKeyEntry(keyPq, NOW - 86_400),
+        activeKeyEntry(keyPq2, T2),
+      ],
+    });
+    const chain = await verifyKeyDirectoryChain([directory, e2, e3, regressed], 1, {
+      expectedIssuer: ISSUER,
+    });
+    expect(chain.code).toBe("DIRECTORY_CHAIN_STATUS_REGRESSED");
+  });
+
+  it("reads revocation from the latest chained epoch", async () => {
+    const r = await issue();
+    const revoked = await buildKeyDirectory({
+      issuer: ISSUER,
+      epoch: 2,
+      prevRoot: directory.root,
+      publishedAt: NOW + 50,
+      governance: [govEd, govPq],
+      keys: [
+        activeKeyEntry(keyEd, NOW - 86_400),
+        { ...activeKeyEntry(keyPq, NOW - 86_400), status: "revoked", revokedAt: NOW + 50 },
+      ],
+    });
+    const v = await verifyDeliveryReceipt(r, { directories: [directory, revoked], now: NOW + 60 });
+    expect(v.levels.authentic).toBe(true);
+    expect(v.levels.trusted).toBe(false);
+    expect(codes(v)).toContain("KEY_REVOKED");
+    // The session path uses the Ed25519 key, which was not revoked.
+    const s = await verifyDeliveryReceipt(r, {
+      directories: [directory, revoked],
+      path: "session",
+      now: NOW + 60,
+    });
+    expect(s.valid).toBe(true);
+  });
+
+  it("rejects a digest that does not name the directory, and stale or future epochs", async () => {
+    const r = await issue();
+    const wrongDigest = (
+      await signDeliveryReceipt({ ...r.payload, keyDirectoryDigest: "cd".repeat(32) }, signers)
+    ).receipt;
+    expect(codes(await verifyDeliveryReceipt(wrongDigest, { directory, now: NOW }))).toContain(
+      "KEY_DIRECTORY_DIGEST_MISMATCH",
+    );
+    // Issued under epoch 1 although epoch 2 was already in force.
+    const stale = (await signDeliveryReceipt({ ...r.payload, issuedAt: T2 + 600 }, signers))
+      .receipt;
+    expect(
+      codes(await verifyDeliveryReceipt(stale, { directories: [directory, e2], now: T2 + 600 })),
+    ).toContain("KEY_DIRECTORY_SUPERSEDED");
+    const early = (await signDeliveryReceipt({ ...r.payload, issuedAt: NOW - 90_000 }, signers))
+      .receipt;
+    expect(codes(await verifyDeliveryReceipt(early, { directory, now: NOW }))).toContain(
+      "KEY_DIRECTORY_NOT_IN_FORCE",
+    );
+    expect(
+      codes(await verifyDeliveryReceipt(r, { directories: [e2], directoryTrust: pinnedPq() })),
+    ).toContain("DIRECTORY_EPOCH_UNAVAILABLE");
+  });
+
+  it("fetches the stable URL and the per-epoch archives it needs", async () => {
+    const served: string[] = [];
+    const docs: Record<string, KeyDirectory> = {
+      [DIR_URL]: e3,
+      [keyDirectoryEpochUrl(DIR_URL, 1)]: directory,
+      [keyDirectoryEpochUrl(DIR_URL, 2)]: e2,
+    };
+    const f = (async (url: string) => {
+      served.push(url);
+      return docs[url]
+        ? new Response(JSON.stringify(docs[url]))
+        : new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    const chain = await fetchKeyDirectoryChain(DIR_URL, 1, f);
+    expect(served).toEqual([DIR_URL, `${DIR_URL}/epoch/1`, `${DIR_URL}/epoch/2`]);
+    expect(chain).toHaveLength(3);
+    const v = await verifyDeliveryReceipt(await issue(), { directories: chain, now: T3 });
+    expect(v.valid).toBe(true);
+    served.length = 0;
+    expect(await fetchKeyDirectoryChain(DIR_URL, 3, f)).toHaveLength(1);
+    expect(served).toEqual([DIR_URL]);
+  });
+});
+
 describe("delivery-receipt: server extension", () => {
   it("declares itself in the 402 response", async () => {
-    const ext = createDeliveryReceiptExtension({
-      issuer: ISSUER,
-      signer: createLocalReceiptSigner(receiptKey),
-    });
+    const ext = createDeliveryReceiptExtension(config());
     const out = (await ext.enrichPaymentRequiredResponse!({}, {} as PaymentRequiredContext)) as {
       info: Record<string, unknown>;
     };
     expect(out.info).toEqual({
       version: 1,
       issuer: ISSUER,
-      keyDirectory: `${ISSUER}/.well-known/x402-receipt-keys`,
-      algorithms: ["ml-dsa-65"],
-      delivery: "inline",
+      keyDirectory: DIR_URL,
+      algorithms: ["ed25519", "ml-dsa-65"],
+      deliveryMode: "body",
+      receiptTransport: "inline",
     });
     expect(declareDeliveryReceiptExtension()).toEqual({ [DELIVERY_RECEIPT]: {} });
     expect(() =>
-      createDeliveryReceiptExtension({
-        issuer: ISSUER,
-        keyDirectory: "https://other.example/keys",
-        signer: createLocalReceiptSigner(receiptKey),
-      }),
+      createDeliveryReceiptExtension(config({ keyDirectory: "https://other.example/keys" })),
     ).toThrow(/same-origin/);
   });
 
-  it("binds settlement, resource and body digest into the signed payload", async () => {
+  it("refuses to run without the ed25519 + ml-dsa-65 pair", () => {
+    expect(() => createDeliveryReceiptExtension(config({ signers: [signers[1]] }))).toThrow(
+      /ed25519 and ml-dsa-65/,
+    );
+    expect(() =>
+      createDeliveryReceiptExtension(config({ signers: [signers[0], signers[0]] })),
+    ).toThrow(/ed25519 and ml-dsa-65/);
+  });
+
+  it("refuses to sign with a key that is not in the directory epoch", async () => {
+    const stray = createLocalReceiptSigner(await generateReceiptKeyPair("ml-dsa-65", seed(5)));
+    await expect(issue(settleContext(), { signers: [signers[0], stray] })).rejects.toThrow(
+      /not in directory/,
+    );
+  });
+
+  it("binds settlement, resource, body digest and directory into the signed payload", async () => {
     const receipt = await issue(
       settleContext({
         paymentPayload: {
@@ -293,9 +587,12 @@ describe("delivery-receipt: server extension", () => {
         } as unknown as PaymentPayload,
       }),
     );
-    expect(receipt.alg).toBe("ml-dsa-65");
-    expect(receipt.kid).toBe(receiptKey.kid);
-    expect(fromCanonicalBase64(receipt.signature)!.length).toBe(3309);
+    expect(receipt.signatures.map(s => [s.alg, s.kid])).toEqual([
+      ["ed25519", keyEd.kid],
+      ["ml-dsa-65", keyPq.kid],
+    ]);
+    expect(fromCanonicalBase64(sigOf(receipt, "ml-dsa-65").signature)!.length).toBe(3309);
+    expect(fromCanonicalBase64(sigOf(receipt, "ed25519").signature)!.length).toBe(64);
     expect(receipt.payload).toEqual({
       version: 1,
       issuer: ISSUER,
@@ -311,8 +608,10 @@ describe("delivery-receipt: server extension", () => {
       logIndex: null,
       paymentId: "pay_7d5d747be160e280504c",
       responseStatus: null,
-      responseSha256: await sha256Hex(BODY),
       responseContentType: "application/json",
+      delivery: { mode: "body", sha256: await sha256Hex(BODY) },
+      keyDirectoryEpoch: 1,
+      keyDirectoryDigest: directory.root,
       issuedAt: NOW,
     });
   });
@@ -330,59 +629,51 @@ describe("delivery-receipt: server extension", () => {
     expect(foreign.payload.resourceUrl).toBe("http://other.example/premium-data");
   });
 
-  it("issues nothing for failed settles, before-handler settles or missing bodies", async () => {
+  it("issues nothing for failed settles, before-handler settles, missing bodies or streams", async () => {
+    const ext = createDeliveryReceiptExtension(config());
     expect(
-      await createDeliveryReceiptExtension({
-        issuer: ISSUER,
-        signer: createLocalReceiptSigner(receiptKey),
-      }).enrichSettlementResponse!({}, settleContext({ result: { ...settle, success: false } })),
+      await ext.enrichSettlementResponse!(
+        {},
+        settleContext({ result: { ...settle, success: false } }),
+      ),
     ).toBeUndefined();
-    const ext = createDeliveryReceiptExtension({
-      issuer: ISSUER,
-      signer: createLocalReceiptSigner(receiptKey),
-    });
     expect(
       await ext.enrichSettlementResponse!({}, settleContext({ phase: "before-handler" })),
-    ).toBe(undefined);
+    ).toBeUndefined();
     expect(
       await ext.enrichSettlementResponse!(
         {},
         settleContext({ transportContext: { request: transport().request } }),
       ),
     ).toBeUndefined();
+    const streamExt = createDeliveryReceiptExtension(config({ deliveryMode: "stream" }));
+    expect(await streamExt.enrichSettlementResponse!({}, settleContext())).toBeUndefined();
   });
 
   it("records the resolved log index and tolerates resolver failure", async () => {
-    const mk = (resolveLogIndex: () => Promise<number | null>) =>
-      createDeliveryReceiptExtension({
-        issuer: ISSUER,
-        signer: createLocalReceiptSigner(receiptKey),
-        resolveLogIndex,
-        now: () => NOW,
-      });
-    const ok = (await mk(async () => 312).enrichSettlementResponse!({}, settleContext())) as {
-      info: { receipt: DeliveryReceipt };
-    };
-    expect(ok.info.receipt.payload.logIndex).toBe(312);
-    const bad = (await mk(async () => {
-      throw new Error("rpc down");
-    }).enrichSettlementResponse!({}, settleContext())) as { info: { receipt: DeliveryReceipt } };
-    expect(bad.info.receipt.payload.logIndex).toBeNull();
+    expect(
+      (await issue(settleContext(), { resolveLogIndex: async () => 312 })).payload.logIndex,
+    ).toBe(312);
+    const bad = await issue(settleContext(), {
+      resolveLogIndex: async () => {
+        throw new Error("rpc down");
+      },
+    });
+    expect(bad.payload.logIndex).toBeNull();
   });
 
   it("supports delivery by reference with id check on resolution", async () => {
     const store = new Map<string, DeliveryReceipt>();
-    const ext = createDeliveryReceiptExtension({
-      issuer: ISSUER,
-      signer: createLocalReceiptSigner(receiptKey),
-      now: () => NOW,
-      receiptStore: {
-        put: async (id, r) => {
-          store.set(id, r);
-          return `${ISSUER}/x402/receipts/${id}`;
+    const ext = createDeliveryReceiptExtension(
+      config({
+        receiptStore: {
+          put: async (id, r) => {
+            store.set(id, r);
+            return `${ISSUER}/x402/receipts/${id}`;
+          },
         },
-      },
-    });
+      }),
+    );
     const out = (await ext.enrichSettlementResponse!({}, settleContext())) as {
       info: { receiptId: string; receiptUrl: string };
     };
@@ -405,7 +696,7 @@ describe("delivery-receipt: server extension", () => {
   });
 });
 
-describe("delivery-receipt: verification", () => {
+describe("delivery-receipt: verification paths", () => {
   const expected = () => ({
     settle,
     requirements,
@@ -414,40 +705,97 @@ describe("delivery-receipt: verification", () => {
     responseBody: BODY,
   });
 
-  it("accepts a genuine receipt at every level", async () => {
+  it("accepts a genuine receipt at every level on both paths and reports the path", async () => {
     const receipt = await issue();
-    const v = await verifyDeliveryReceipt(receipt, {
+    const archival = await verifyDeliveryReceipt(receipt, {
       directory,
-      directoryTrust: { pinnedGovernanceKeys: [governance.publicKeyB64] },
+      directoryTrust: pinnedPq(),
       expected: expected(),
       now: NOW,
     });
-    expect(v.reasons).toEqual([]);
-    expect(v).toMatchObject({
+    expect(archival.reasons).toEqual([]);
+    expect(archival).toMatchObject({
       valid: true,
+      path: "archival",
+      longTermEvidence: true,
       trustBasis: "pinned",
+      signaturesVerified: [{ alg: "ml-dsa-65", kid: keyPq.kid, engine: "noble" }],
       levels: { integrity: true, authentic: true, trusted: true, settlement: true, delivery: true },
     });
-    expect(v.receiptId).toBe(await computeReceiptId(receipt.payload));
+    expect(archival.receiptId).toBe(await computeReceiptId(receipt.payload));
+
+    const session = await verifyDeliveryReceipt(receipt, {
+      directory,
+      path: "session",
+      expected: expected(),
+      now: NOW,
+    });
+    expect(session.reasons).toEqual([]);
+    expect(session).toMatchObject({
+      valid: true,
+      path: "session",
+      longTermEvidence: false,
+      trustBasis: "tls",
+      signaturesVerified: [{ alg: "ed25519", kid: keyEd.kid, engine: "webcrypto" }],
+    });
   });
 
-  it("rejects an altered receipt (payload and signature)", async () => {
+  it("verifies each path's signature independently", async () => {
+    const receipt = await issue();
+    const badPq = clone(receipt);
+    sigOf(badPq, "ml-dsa-65").signature = flip(sigOf(badPq, "ml-dsa-65").signature);
+    expect((await verifyDeliveryReceipt(badPq, { directory, now: NOW })).levels.authentic).toBe(
+      false,
+    );
+    // In session only the Ed25519 signature is checked; the result is not long-term evidence.
+    const s = await verifyDeliveryReceipt(badPq, { directory, path: "session", now: NOW });
+    expect(s.valid).toBe(true);
+    expect(s.longTermEvidence).toBe(false);
+
+    const badEd = clone(receipt);
+    sigOf(badEd, "ed25519").signature = flip(sigOf(badEd, "ed25519").signature);
+    expect(
+      (await verifyDeliveryReceipt(badEd, { directory, path: "session", now: NOW })).levels
+        .authentic,
+    ).toBe(false);
+    expect((await verifyDeliveryReceipt(badEd, { directory, now: NOW })).valid).toBe(true);
+  });
+
+  it("requires the signature pair structurally on every path", async () => {
+    const receipt = await issue();
+    for (const keep of ["ed25519", "ml-dsa-65"]) {
+      const stripped = { ...clone(receipt), signatures: [sigOf(receipt, keep)] };
+      for (const path of ["session", "archival"] as const) {
+        const v = await verifyDeliveryReceipt(stripped, { directory, path, now: NOW });
+        expect(v.levels.integrity).toBe(false);
+        expect(codes(v)).toEqual(["SIGNATURES_SHAPE"]);
+      }
+    }
+    const twoEd = {
+      ...clone(receipt),
+      signatures: [sigOf(receipt, "ed25519"), sigOf(receipt, "ed25519")],
+    };
+    expect(codes(await verifyDeliveryReceipt(twoEd, { directory, now: NOW }))).toEqual([
+      "SIGNATURES_DUPLICATE_ALG",
+    ]);
+    const ed87 = await generateReceiptKeyPair("ml-dsa-87", seed(6));
+    const extra = (
+      await signDeliveryReceipt(receipt.payload, [signers[0], createLocalReceiptSigner(ed87)])
+    ).receipt;
+    expect(codes(await verifyDeliveryReceipt(extra, { directory, now: NOW }))).toEqual([
+      "SIGNATURE_PAIR_MISSING",
+    ]);
+  });
+
+  it("rejects an altered payload on both paths, and unsigned fields", async () => {
     const receipt = await issue();
     const altered = clone(receipt);
     altered.payload.amount = "1";
-    const v1 = await verifyDeliveryReceipt(altered, { directory, now: NOW });
-    expect(v1.valid).toBe(false);
-    expect(v1.levels.authentic).toBe(false);
-    expect(v1.reasons.map(r => r.code)).toContain("SIGNATURE_INVALID");
-
-    const badSig = clone(receipt);
-    const bytes = fromCanonicalBase64(badSig.signature)!;
-    bytes[10] ^= 0xff;
-    badSig.signature = Buffer.from(bytes).toString("base64");
-    expect((await verifyDeliveryReceipt(badSig, { directory, now: NOW })).levels.authentic).toBe(
-      false,
-    );
-
+    for (const path of ["session", "archival"] as const) {
+      const v = await verifyDeliveryReceipt(altered, { directory, path, now: NOW });
+      expect(v.valid).toBe(false);
+      expect(codes(v)).toContain("SIGNATURE_INVALID");
+    }
     const extraField = { ...clone(receipt), note: "unsigned" };
     expect(
       (await verifyDeliveryReceipt(extraField, { directory, now: NOW })).levels.integrity,
@@ -457,46 +805,42 @@ describe("delivery-receipt: verification", () => {
     expect(
       (await verifyDeliveryReceipt(floatPayload, { directory, now: NOW })).levels.integrity,
     ).toBe(false);
+    const badDelivery = clone(receipt);
+    (badDelivery.payload.delivery as unknown as Record<string, unknown>).extra = 1;
+    expect(codes(await verifyDeliveryReceipt(badDelivery, { directory, now: NOW }))).toEqual([
+      "PAYLOAD_FIELD_delivery",
+    ]);
   });
 
   it("rejects receipts signed by an untrusted key", async () => {
-    const rogue = await generateReceiptKeyPair("ml-dsa-65", seed(7));
+    const rogueEd = await generateReceiptKeyPair("ed25519", seed(7));
+    const roguePq = await generateReceiptKeyPair("ml-dsa-65", seed(7));
     const receipt = await issue();
-    const { receipt: rogueReceipt } = await signDeliveryReceipt(
-      receipt.payload,
-      createLocalReceiptSigner(rogue),
+    const rogueSigners = [rogueEd, roguePq].map(createLocalReceiptSigner);
+    const { receipt: rogueReceipt } = await signDeliveryReceipt(receipt.payload, rogueSigners);
+    expect(codes(await verifyDeliveryReceipt(rogueReceipt, { directory, now: NOW }))).toContain(
+      "KEY_NOT_LISTED",
     );
-    const v = await verifyDeliveryReceipt(rogueReceipt, { directory, now: NOW });
-    expect(v.valid).toBe(false);
-    expect(v.reasons.map(r => r.code)).toContain("KEY_NOT_LISTED");
-
-    // Rogue key listed in a directory signed by a governance key the client did not pin.
-    const rogueGov = await generateReceiptKeyPair("ml-dsa-65", seed(8));
     const rogueDir = await buildKeyDirectory({
       issuer: ISSUER,
-      governance: rogueGov,
-      keys: [activeKeyEntry(rogue, NOW - 10)],
+      publishedAt: NOW - 10,
+      governance: [
+        await generateReceiptKeyPair("ed25519", seed(8)),
+        await generateReceiptKeyPair("ml-dsa-65", seed(8)),
+      ],
+      keys: [activeKeyEntry(rogueEd, NOW - 10), activeKeyEntry(roguePq, NOW - 10)],
     });
-    const v2 = await verifyDeliveryReceipt(rogueReceipt, {
+    const { receipt: r2 } = await signDeliveryReceipt(
+      { ...receipt.payload, keyDirectoryDigest: rogueDir.root },
+      rogueSigners,
+    );
+    const v2 = await verifyDeliveryReceipt(r2, {
       directory: rogueDir,
-      directoryTrust: { pinnedGovernanceKeys: [governance.publicKeyB64] },
+      directoryTrust: pinnedPq(),
       now: NOW,
     });
     expect(v2.valid).toBe(false);
-    expect(v2.reasons.map(r => r.code)).toContain("DIRECTORY_SIGNER_NOT_PINNED");
-
-    // Same key, now revoked in the genuine directory.
-    const revokedDir = await buildKeyDirectory({
-      issuer: ISSUER,
-      governance,
-      epoch: 2,
-      prevRoot: directory.root,
-      keys: [{ ...activeKeyEntry(receiptKey, NOW - 86_400), status: "revoked", revokedAt: NOW }],
-    });
-    const v3 = await verifyDeliveryReceipt(receipt, { directory: revokedDir, now: NOW });
-    expect(v3.levels.authentic).toBe(true);
-    expect(v3.levels.trusted).toBe(false);
-    expect(v3.reasons.map(r => r.code)).toContain("KEY_REVOKED");
+    expect(codes(v2)).toContain("DIRECTORY_SIGNER_NOT_PINNED");
   });
 
   it("rejects a receipt whose settlement does not match what the client observed", async () => {
@@ -526,7 +870,6 @@ describe("delivery-receipt: verification", () => {
         detail: field,
       });
     }
-    // Address comparison is case-insensitive for EVM addresses.
     const v = await verifyDeliveryReceipt(receipt, {
       directory,
       expected: { settle: { ...settle, payer: settle.payer!.toLowerCase() } },
@@ -535,60 +878,338 @@ describe("delivery-receipt: verification", () => {
     expect(v.levels.settlement).toBe(true);
   });
 
-  it("rejects a receipt whose body digest does not match the served bytes", async () => {
+  it("rejects a body that does not match, and a mode that does not match", async () => {
     const receipt = await issue();
     const v = await verifyDeliveryReceipt(receipt, {
       directory,
       expected: { ...expected(), responseBody: new TextEncoder().encode('{"price":"1"}') },
       now: NOW,
     });
-    expect(v.valid).toBe(false);
     expect(v.levels.delivery).toBe(false);
-    expect(v.reasons.map(r => r.code)).toContain("BODY_DIGEST_MISMATCH");
+    expect(codes(v)).toContain("BODY_DIGEST_MISMATCH");
+    const m = await verifyDeliveryReceipt(receipt, {
+      directory,
+      expected: { frames: ["a"] },
+      now: NOW,
+    });
+    expect(codes(m)).toEqual(["DELIVERY_MODE_MISMATCH"]);
   });
 
-  it("enforces issuer authorization for the resource origin", async () => {
+  it("enforces issuer authorization and rejects future-dated receipts", async () => {
     const receipt = await issue(
       settleContext({ transportContext: transport(BODY, "https://shop.example/x") }),
     );
     const v = await verifyDeliveryReceipt(receipt, { directory, now: NOW });
-    expect(v.levels.trusted).toBe(false);
-    expect(v.reasons.map(r => r.code)).toContain("ISSUER_NOT_AUTHORIZED");
-    const v2 = await verifyDeliveryReceipt(receipt, {
-      directory,
-      acceptedIssuers: [ISSUER],
-      now: NOW,
-    });
-    expect(v2.valid).toBe(true);
+    expect(codes(v)).toContain("ISSUER_NOT_AUTHORIZED");
+    expect(
+      (await verifyDeliveryReceipt(receipt, { directory, acceptedIssuers: [ISSUER], now: NOW }))
+        .valid,
+    ).toBe(true);
+    const future = await verifyDeliveryReceipt(await issue(), { directory, now: NOW - 3600 });
+    expect(codes(future)).toContain("ISSUED_AT_IN_FUTURE");
+  });
+});
+
+describe("delivery-receipt: composition with offer-receipt", () => {
+  /**
+   * Settles through x402ResourceServer with both extensions registered and declared.
+   *
+   * @param includeTxHash - offer-receipt includeTxHash option
+   * @returns The settle response
+   */
+  async function settleBoth(includeTxHash: boolean): Promise<SettleResponse> {
+    const { privateKey } = await generateES256KeyPair();
+    const kid = "did:web:api.example.com#key-1";
+    const facilitator: FacilitatorClient = {
+      verify: vi.fn(async () => ({ isValid: true, payer: settle.payer })),
+      settle: vi.fn(async () => ({ ...settle })),
+      getSupported: vi.fn(async () => ({ kinds: [], extensions: [], signers: {} })),
+    };
+    const server = new x402ResourceServer(facilitator)
+      .registerExtension(
+        createOfferReceiptExtension(
+          createJWSOfferReceiptIssuer(kid, createES256Signer(privateKey, kid)),
+        ),
+      )
+      .registerExtension(createDeliveryReceiptExtension(config()));
+    return server.settlePayment(
+      { x402Version: 2, accepted: requirements, payload: {}, resource: { url: RESOURCE } } as never,
+      requirements,
+      { ...declareOfferReceiptExtension({ includeTxHash }), ...declareDeliveryReceiptExtension() },
+      transport(),
+    );
+  }
+
+  it("accepts two receipts that describe the same payment", async () => {
+    for (const includeTxHash of [true, false]) {
+      const result = await settleBoth(includeTxHash);
+      const facts = offerReceiptFacts(result)!;
+      expect(facts.transaction).toBe(includeTxHash ? settle.transaction : null);
+      const receipt = (extractDeliveryReceipt(result) as { receipt: DeliveryReceipt }).receipt;
+      const v = await verifyDeliveryReceipt(receipt, {
+        directory,
+        expected: { settle, offerReceipt: facts },
+        now: NOW,
+      });
+      expect(v.reasons, String(includeTxHash)).toEqual([]);
+      expect(v.levels.settlement).toBe(true);
+    }
   });
 
-  it("rejects future-dated receipts and supports ed25519 as a declared algorithm", async () => {
-    const receipt = await issue();
-    const v = await verifyDeliveryReceipt(receipt, { directory, now: NOW - 3600 });
-    expect(v.reasons.map(r => r.code)).toContain("ISSUED_AT_IN_FUTURE");
+  it("rejects when the offer-receipt names another transaction, payer or network", async () => {
+    const result = await settleBoth(true);
+    const receipt = (extractDeliveryReceipt(result) as { receipt: DeliveryReceipt }).receipt;
+    const facts = offerReceiptFacts(result)!;
+    for (const [field, override] of [
+      ["transaction", { transaction: "0x" + "cd".repeat(32) }],
+      ["payer", { payer: "0x0000000000000000000000000000000000000003" }],
+      ["network", { network: "eip155:1" }],
+    ] as const) {
+      const v = await verifyDeliveryReceipt(receipt, {
+        directory,
+        expected: { offerReceipt: { ...facts, ...override } },
+        now: NOW,
+      });
+      expect(v.valid, field).toBe(false);
+      expect(v.reasons, field).toContainEqual({
+        level: "settlement",
+        code: "OFFER_RECEIPT_MISMATCH",
+        detail: `offer-receipt.${field}`,
+      });
+    }
+  });
 
-    const edKey = await generateReceiptKeyPair("ed25519", seed(3));
-    const edDir = await buildKeyDirectory({
-      issuer: ISSUER,
-      governance,
-      keys: [activeKeyEntry(edKey, NOW - 10)],
+  it("is applied by the fetch plugin when both receipts are in PAYMENT-RESPONSE", async () => {
+    const result = await settleBoth(true);
+    const offer = (result.extensions as Record<string, { info: { receipt: unknown } }>)[
+      OFFER_RECEIPT
+    ];
+    const mk = (offerInfo: unknown) =>
+      (async (input: RequestInfo | URL) => {
+        const req = new Request(input);
+        if (req.url === DIR_URL) return new Response(JSON.stringify(directory));
+        return new Response(BODY, {
+          headers: {
+            "PAYMENT-RESPONSE": encodePaymentResponseHeader({
+              ...result,
+              extensions: { ...result.extensions, [OFFER_RECEIPT]: offerInfo },
+            } as SettleResponse),
+          },
+        });
+      }) as typeof fetch;
+    const paid = () =>
+      new Request(RESOURCE, {
+        headers: {
+          "PAYMENT-SIGNATURE": encodePaymentSignatureHeader({
+            x402Version: 2,
+            accepted: requirements,
+            payload: {},
+            resource: { url: RESOURCE },
+          } as unknown as PaymentPayload),
+        },
+      });
+    vi.useFakeTimers({ now: NOW * 1000 });
+    try {
+      const ok = await withDeliveryReceipts(mk(offer))(paid());
+      expect(getDeliveryReceiptResult(ok)!.reasons).toEqual([]);
+      const forged = {
+        info: {
+          receipt: {
+            format: "eip712",
+            payload: {
+              version: 1,
+              network: settle.network,
+              resourceUrl: RESOURCE,
+              payer: settle.payer,
+              issuedAt: NOW,
+              transaction: "0x" + "ef".repeat(32),
+            },
+            signature: "0x00",
+          },
+        },
+      };
+      const bad = await withDeliveryReceipts(mk(forged))(paid());
+      expect(codes(getDeliveryReceiptResult(bad)!)).toContain("OFFER_RECEIPT_MISMATCH");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("delivery-receipt: stream mode (SSE)", () => {
+  const streamContext = {
+    resourceUrl: `${ISSUER}/live-feed`,
+    method: "GET",
+    requirements,
+    settle,
+    responseStatus: 200,
+  };
+  const expectedStream = () => ({
+    settle,
+    requirements,
+    resourceUrl: `${ISSUER}/live-feed`,
+    method: "GET",
+  });
+
+  /**
+   * Simulates a 15-minute priced SSE route: one event per second, then the terminal frame.
+   *
+   * @param n - Number of events
+   * @param overrides - Config overrides
+   * @returns Full event-stream text, the trailer and the frames sent
+   */
+  async function runStream(
+    n = 900,
+    overrides: Partial<DeliveryReceiptServerConfig> = {},
+  ): Promise<{ text: string; trailer: StreamTrailer; frames: string[] }> {
+    const writer = createSseReceiptWriter(
+      config({ deliveryMode: "stream", ...overrides }),
+      streamContext,
+    );
+    const frames: string[] = [];
+    let text = "";
+    for (let i = 0; i < n; i++) {
+      const data = JSON.stringify({ seq: i, t: NOW - 900 + i, price: (64000 + i).toString() });
+      frames.push(data);
+      text += await writer.frame(data, i % 100 === 0 ? "checkpoint" : undefined);
+    }
+    // A multi-line event and a comment line: framing follows EventSource semantics.
+    frames.push("line one\nline two");
+    text += await writer.frame("line one\nline two");
+    text += ": keep-alive\n\n";
+    const { event, trailer } = await writer.finish();
+    return { text: text + event, trailer, frames };
+  }
+
+  /**
+   * Rebuilds an event-stream from frames plus the original trailer event.
+   *
+   * @param frames - Frames to send
+   * @param trailer - Trailer to append
+   * @returns Event-stream text
+   */
+  const rebuild = (frames: string[], trailer: StreamTrailer) =>
+    frames.map(f => formatSseEvent(f)).join("") +
+    formatSseEvent(JSON.stringify(trailer), STREAM_TRAILER_EVENT);
+
+  it("binds frameCount and the final digest into the receipt and the trailer", async () => {
+    const { text, trailer, frames } = await runStream();
+    const receipt = (trailer as { receipt: DeliveryReceipt }).receipt;
+    const local = await computeStreamDigest(frames);
+    expect(receipt.payload.delivery).toEqual({
+      mode: "stream",
+      framing: "sse",
+      frameCount: 901,
+      digest: local.digest,
     });
-    const { receipt: edReceipt } = await signDeliveryReceipt(
-      receipt.payload,
-      createLocalReceiptSigner(edKey),
-    );
-    expect((await verifyDeliveryReceipt(edReceipt, { directory: edDir, now: NOW })).valid).toBe(
-      true,
-    );
-    // An ML-DSA signature presented as ed25519 fails on length before any crypto runs.
-    expect(
-      (
-        await verifyDeliveryReceipt(
-          { ...receipt, alg: "ed25519", kid: edKey.kid },
-          { directory: edDir, now: NOW },
-        )
-      ).levels.integrity,
-    ).toBe(false);
+    expect(trailer.frameCount).toBe(901);
+    expect(trailer.digest).toBe(local.digest);
+    expect(receipt.payload.responseContentType).toBe("text/event-stream");
+
+    for (const path of ["session", "archival"] as const) {
+      const v = await verifySseDelivery(text, {
+        directory,
+        path,
+        expected: expectedStream(),
+        now: NOW,
+      });
+      expect(v.reasons, path).toEqual([]);
+      expect(v.valid, path).toBe(true);
+      expect(v.levels.delivery, path).toBe(true);
+    }
+  });
+
+  it("detects alteration, reordering, insertion and truncation of frames", async () => {
+    const { trailer, frames } = await runStream(50);
+    const verify = (text: string) =>
+      verifySseDelivery(text, { directory, expected: expectedStream(), now: NOW });
+
+    const altered = [...frames];
+    altered[17] = altered[17].replace('"seq":17', '"seq":71');
+    expect(codes(await verify(rebuild(altered, trailer)))).toEqual(["STREAM_DIGEST_MISMATCH"]);
+
+    const reordered = [...frames];
+    [reordered[3], reordered[4]] = [reordered[4], reordered[3]];
+    expect(codes(await verify(rebuild(reordered, trailer)))).toEqual(["STREAM_DIGEST_MISMATCH"]);
+
+    const inserted = [...frames.slice(0, 10), '{"seq":"injected"}', ...frames.slice(10)];
+    expect(codes(await verify(rebuild(inserted, trailer)))).toEqual([
+      "STREAM_FRAME_COUNT_MISMATCH",
+      "STREAM_DIGEST_MISMATCH",
+    ]);
+
+    const truncated = frames.slice(0, -5);
+    expect(codes(await verify(rebuild(truncated, trailer)))).toEqual([
+      "STREAM_FRAME_COUNT_MISMATCH",
+      "STREAM_DIGEST_MISMATCH",
+    ]);
+
+    const cut = frames.map(f => formatSseEvent(f)).join("");
+    expect(codes(await verify(cut))).toEqual(["STREAM_TRAILER_MISSING"]);
+
+    const lyingTrailer = { ...trailer, frameCount: 10 };
+    expect(codes(await verify(rebuild(frames, lyingTrailer)))).toEqual(["STREAM_TRAILER_MISMATCH"]);
+
+    const after = rebuild(frames, trailer) + formatSseEvent('{"late":true}');
+    expect(codes(await verify(after))).toEqual(["STREAM_EVENTS_AFTER_TRAILER"]);
+  });
+
+  it("rejects a receipt signed over a different stream", async () => {
+    const a = await runStream(5);
+    const b = await runStream(6);
+    const mixed = rebuild(a.frames, {
+      ...a.trailer,
+      receipt: (b.trailer as { receipt: DeliveryReceipt }).receipt,
+    } as StreamTrailer);
+    const v = await verifySseDelivery(mixed, { directory, expected: expectedStream(), now: NOW });
+    expect(v.valid).toBe(false);
+    expect(codes(v)).toContain("STREAM_TRAILER_MISMATCH");
+  });
+
+  it("supports the receipt by reference in the trailer", async () => {
+    const store = new Map<string, DeliveryReceipt>();
+    const { text, trailer } = await runStream(20, {
+      receiptStore: {
+        put: async (id, r) => {
+          store.set(id, r);
+          return `${ISSUER}/x402/receipts/${id}`;
+        },
+      },
+    });
+    expect("receiptUrl" in trailer).toBe(true);
+    const f = (async (url: string) =>
+      new Response(JSON.stringify(store.get(url.split("/").pop()!)))) as unknown as typeof fetch;
+    const v = await verifySseDelivery(text, { directory, expected: expectedStream(), now: NOW }, f);
+    expect(v.reasons).toEqual([]);
+  });
+
+  it("refuses frames after finish and empty frames", async () => {
+    const w = createSseReceiptWriter(config({ deliveryMode: "stream" }), streamContext);
+    await expect(w.frame("")).rejects.toThrow(/empty/);
+    await w.finish();
+    await expect(w.frame("x")).rejects.toThrow(/finished/);
+    const failed = createSseReceiptWriter(config(), {
+      ...streamContext,
+      settle: { ...settle, success: false },
+    });
+    await expect(failed.finish()).rejects.toThrow(/did not succeed/);
+  });
+
+  it("builds stream payloads through the shared payload builder", () => {
+    const p = createReceiptPayload({
+      issuer: ISSUER,
+      resourceUrl: `${ISSUER}/live-feed`,
+      method: "get",
+      requirements,
+      settle,
+      responseStatus: 200,
+      responseContentType: "text/event-stream",
+      delivery: { mode: "stream", framing: "sse", frameCount: 0, digest: "00".repeat(32) },
+      directory,
+      issuedAt: NOW,
+    });
+    expect(p?.method).toBe("GET");
+    expect(p?.keyDirectoryDigest).toBe(directory.root);
   });
 });
 
@@ -601,11 +1222,7 @@ describe("delivery-receipt: x402ResourceServer integration", () => {
       getSupported: vi.fn(async () => ({ kinds: [], extensions: [], signers: {} })),
     };
     const server = new x402ResourceServer(facilitator).registerExtension(
-      createDeliveryReceiptExtension({
-        issuer: ISSUER,
-        signer: createLocalReceiptSigner(receiptKey),
-        now: () => NOW,
-      }),
+      createDeliveryReceiptExtension(config()),
     );
     const paymentPayload = {
       x402Version: 2,
@@ -626,7 +1243,7 @@ describe("delivery-receipt: x402ResourceServer integration", () => {
     expect(info && "receipt" in info).toBe(true);
     const v = await verifyDeliveryReceipt((info as { receipt: DeliveryReceipt }).receipt, {
       directory,
-      directoryTrust: { pinnedGovernanceKeys: [governance.publicKeyB64] },
+      directoryTrust: pinnedPq(),
       expected: { settle, requirements, resourceUrl: RESOURCE, method: "GET", responseBody: BODY },
       now: NOW,
     });
@@ -640,13 +1257,18 @@ describe("delivery-receipt: fetch plugin", () => {
    *
    * @param receipt - Receipt to attach (undefined = declared but not delivered)
    * @param body - Body to serve
+   * @param dirs - Directory documents by URL
    * @returns fetch-compatible function
    */
-  const network = (receipt: DeliveryReceipt | undefined, body: Uint8Array = BODY) =>
+  const network = (
+    receipt: DeliveryReceipt | undefined,
+    body: Uint8Array = BODY,
+    dirs: Record<string, unknown> = { [DIR_URL]: directory },
+  ) =>
     (async (input: RequestInfo | URL) => {
       const req = new Request(input);
-      if (req.url.endsWith("/.well-known/x402-receipt-keys")) {
-        return new Response(JSON.stringify(directory), {
+      if (req.url in dirs) {
+        return new Response(JSON.stringify(dirs[req.url]), {
           headers: { "content-type": "application/json" },
         });
       }
@@ -663,7 +1285,7 @@ describe("delivery-receipt: fetch plugin", () => {
       });
     }) as typeof fetch;
 
-  const paidRequest = () =>
+  const paidRequest = (deliveryMode = "body") =>
     new Request(RESOURCE, {
       headers: {
         "PAYMENT-SIGNATURE": encodePaymentSignatureHeader({
@@ -676,8 +1298,9 @@ describe("delivery-receipt: fetch plugin", () => {
               info: {
                 version: 1,
                 issuer: ISSUER,
-                keyDirectory: `${ISSUER}/.well-known/x402-receipt-keys`,
-                algorithms: ["ml-dsa-65"],
+                keyDirectory: DIR_URL,
+                algorithms: ["ed25519", "ml-dsa-65"],
+                deliveryMode,
               },
             },
           },
@@ -685,11 +1308,11 @@ describe("delivery-receipt: fetch plugin", () => {
       },
     });
 
-  it("verifies the receipt against the payment that was sent and the body received", async () => {
+  it("verifies the receipt in session (Ed25519) against the payment sent and the body received", async () => {
     const receipt = await issue();
     const onResult = vi.fn();
     const f = withDeliveryReceipts(network(receipt), {
-      pinnedGovernanceKeys: [governance.publicKeyB64],
+      pinnedGovernanceKeys: [govEd.publicKeyB64],
       onResult,
     });
     vi.useFakeTimers({ now: NOW * 1000 });
@@ -698,8 +1321,40 @@ describe("delivery-receipt: fetch plugin", () => {
       expect(await res.text()).toBe(new TextDecoder().decode(BODY)); // body still readable
       const v = getDeliveryReceiptResult(res)!;
       expect(v.reasons).toEqual([]);
-      expect(v.valid).toBe(true);
+      expect(v).toMatchObject({ valid: true, path: "session", longTermEvidence: false });
       expect(onResult).toHaveBeenCalledOnce();
+      const archival = await withDeliveryReceipts(network(receipt), {
+        pinnedGovernanceKeys: [govPq.publicKeyB64],
+        path: "archival",
+      })(paidRequest());
+      expect(getDeliveryReceiptResult(archival)).toMatchObject({
+        valid: true,
+        longTermEvidence: true,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resolves the issuance epoch through the per-epoch archive", async () => {
+    const receipt = await issue();
+    const e2 = await buildKeyDirectory({
+      issuer: ISSUER,
+      epoch: 2,
+      prevRoot: directory.root,
+      publishedAt: NOW + 100,
+      governance: [govEd, govPq],
+      keys: directory.keys,
+    });
+    const dirs = { [DIR_URL]: e2, [`${DIR_URL}/epoch/1`]: directory };
+    vi.useFakeTimers({ now: (NOW + 200) * 1000 });
+    try {
+      const res = await withDeliveryReceipts(network(receipt, BODY, dirs))(paidRequest());
+      expect(getDeliveryReceiptResult(res)).toMatchObject({
+        valid: true,
+        directoryEpoch: 1,
+        latestDirectoryEpoch: 2,
+      });
     } finally {
       vi.useRealTimers();
     }
@@ -712,17 +1367,17 @@ describe("delivery-receipt: fetch plugin", () => {
       const tampered = await withDeliveryReceipts(network(receipt, new Uint8Array([123, 125])))(
         paidRequest(),
       );
-      expect(getDeliveryReceiptResult(tampered)!.reasons.map(r => r.code)).toContain(
-        "BODY_DIGEST_MISMATCH",
-      );
+      expect(codes(getDeliveryReceiptResult(tampered)!)).toContain("BODY_DIGEST_MISMATCH");
       const missing = await withDeliveryReceipts(network(undefined))(paidRequest());
       expect(getDeliveryReceiptResult(missing)!.reasons[0].code).toBe("RECEIPT_MISSING");
       await expect(
         withDeliveryReceipts(network(undefined), { requireValidReceipt: true })(paidRequest()),
       ).rejects.toThrow(/settled in 0x5c6e/);
-      // Unpaid requests pass through untouched.
+      // Unpaid requests and streamed routes pass through untouched.
       const plain = await withDeliveryReceipts(network(receipt))(RESOURCE);
       expect(getDeliveryReceiptResult(plain)).toBeUndefined();
+      const streamed = await withDeliveryReceipts(network(undefined))(paidRequest("stream"));
+      expect(getDeliveryReceiptResult(streamed)).toBeUndefined();
     } finally {
       vi.useRealTimers();
     }

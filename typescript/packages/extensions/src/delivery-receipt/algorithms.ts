@@ -89,6 +89,82 @@ export function verifySignature(
   }
 }
 
+/** Engine that verified a signature. */
+export type VerifyEngine = "webcrypto" | "noble";
+
+let webCryptoEd25519: Promise<boolean> | undefined;
+
+/**
+ * Whether this runtime's WebCrypto implements Ed25519 (Workers, Deno, Node >= 20, recent
+ * browsers). Probed once by importing a fixed valid public key.
+ *
+ * @returns True when `crypto.subtle` can import Ed25519 keys
+ */
+export function hasWebCryptoEd25519(): Promise<boolean> {
+  webCryptoEd25519 ??= (async () => {
+    try {
+      if (!globalThis.crypto?.subtle) return false;
+      await crypto.subtle.importKey(
+        "raw",
+        ed25519.getPublicKey(new Uint8Array(32)) as BufferSource,
+        { name: "Ed25519" },
+        false,
+        ["verify"],
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  return webCryptoEd25519;
+}
+
+/**
+ * Verifies a signature, using WebCrypto for Ed25519 where the runtime provides it (the
+ * in-session path of §8.1) and the bundled implementation otherwise. Never throws.
+ *
+ * @param alg - Algorithm identifier
+ * @param publicKey - Raw public key bytes
+ * @param message - Signed message bytes
+ * @param signature - Raw signature bytes
+ * @returns Whether the signature is valid and which engine checked it
+ */
+export async function verifySignatureWithEngine(
+  alg: ReceiptAlgorithm,
+  publicKey: Uint8Array,
+  message: Uint8Array,
+  signature: Uint8Array,
+): Promise<{ ok: boolean; engine: VerifyEngine }> {
+  const suite = getAlgorithm(alg);
+  if (
+    alg === "ed25519" &&
+    suite &&
+    publicKey.length === suite.publicKeyBytes &&
+    signature.length === suite.signatureBytes &&
+    (await hasWebCryptoEd25519())
+  ) {
+    try {
+      const key = await crypto.subtle.importKey(
+        "raw",
+        publicKey as BufferSource,
+        { name: "Ed25519" },
+        false,
+        ["verify"],
+      );
+      const ok = await crypto.subtle.verify(
+        { name: "Ed25519" },
+        key,
+        signature as BufferSource,
+        message as BufferSource,
+      );
+      return { ok, engine: "webcrypto" };
+    } catch {
+      return { ok: false, engine: "webcrypto" };
+    }
+  }
+  return { ok: verifySignature(alg, publicKey, message, signature), engine: "noble" };
+}
+
 /**
  * Recommended key id derivation (§7.2): first 16 hex chars of SHA-256 over the base64 key text.
  *

@@ -4,24 +4,32 @@
 
 import { decodePaymentResponseHeader, decodePaymentSignatureHeader } from "@x402/core/http";
 import type { PaymentPayload, PaymentRequirements, SettleResponse } from "@x402/core/types";
-import { getAlgorithm, verifySignature } from "./algorithms";
+import { OFFER_RECEIPT, type SignedReceipt } from "../offer-receipt/types";
+import { extractReceiptPayload } from "../offer-receipt/signing";
+import { getAlgorithm, verifySignatureWithEngine } from "./algorithms";
 import {
   DEFAULT_CLOCK_SKEW_SECONDS,
-  fetchKeyDirectory,
+  fetchKeyDirectoryChain,
   keyAuthorizationError,
-  verifyKeyDirectory,
+  pathAlgorithm,
+  verifyKeyDirectoryChain,
   type DirectoryVerificationOptions,
 } from "./directory";
 import { computeReceiptId, fromCanonicalBase64, receiptSignedMessage, sha256Hex } from "./encoding";
+import { computeStreamDigest, parseSse, splitSseStream } from "./stream";
 import {
+  ARCHIVAL_ALGORITHM,
   DELIVERY_RECEIPT,
   KEY_DIRECTORY_WELL_KNOWN_PATH,
+  SESSION_ALGORITHM,
   type DeliveryReceipt,
+  type DeliveryReceiptDeclarationInfo,
   type DeliveryReceiptPayload,
   type DeliveryReceiptSettleInfo,
-  type ReceiptAlgorithm,
   type ReceiptVerificationLevels,
   type ReceiptVerificationResult,
+  type StreamTrailer,
+  type VerificationPath,
 } from "./types";
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -81,15 +89,37 @@ export interface ReceiptExpectations {
   resourceUrl?: string;
   method?: string;
   paymentId?: string | null;
+  /** Body octets received (body mode). */
   responseBody?: Uint8Array;
   responseStatus?: number;
+  /** Frames received before the terminal frame, in order (stream mode). */
+  frames?: (Uint8Array | string)[];
+  /** `frameCount`/`digest` read from the terminal frame (stream mode). */
+  trailer?: { frameCount: unknown; digest: unknown };
+  /** `offer-receipt` receipt found in the same SettleResponse (§2.1 composition rule). */
+  offerReceipt?: OfferReceiptFacts;
+}
+
+/** Fields of an `offer-receipt` receipt payload that the composition rule compares (§2.1). */
+export interface OfferReceiptFacts {
+  network: string;
+  payer: string;
+  /** `null` when the offer-receipt omitted the optional transaction. */
+  transaction: string | null;
 }
 
 export interface VerifyDeliveryReceiptOptions {
-  /** Parsed key directory of the issuer. */
-  directory: unknown;
+  /** Key directory documents: the current one and/or archives / saved copies of any epochs. */
+  directories?: unknown[];
+  /** Single directory document (shorthand for `directories: [directory]`). */
+  directory?: unknown;
   /** Directory trust options (pinned governance keys, rollback state). */
-  directoryTrust?: Omit<DirectoryVerificationOptions, "expectedIssuer">;
+  directoryTrust?: Omit<DirectoryVerificationOptions, "expectedIssuer" | "path">;
+  /**
+   * `session` verifies the Ed25519 signature (in-session, WebCrypto where available);
+   * `archival` (default) verifies the ML-DSA-65 signature and is required for long-term evidence.
+   */
+  path?: VerificationPath;
   /**
    * Issuers accepted in addition to the resource origin (e.g. an independent notary).
    * Never inferred from the receipt (§8.2).
@@ -101,26 +131,77 @@ export interface VerifyDeliveryReceiptOptions {
   skewSeconds?: number;
 }
 
-const PAYLOAD_FIELDS: Record<keyof DeliveryReceiptPayload, "string" | "int" | "nstring" | "nint"> =
-  {
-    version: "int",
-    issuer: "string",
-    resourceUrl: "string",
-    method: "string",
-    scheme: "string",
-    network: "string",
-    asset: "string",
-    payTo: "string",
-    amount: "string",
-    payer: "string",
-    transaction: "string",
-    logIndex: "nint",
-    paymentId: "nstring",
-    responseStatus: "nint",
-    responseSha256: "string",
-    responseContentType: "nstring",
-    issuedAt: "int",
-  };
+type FieldType = "string" | "int" | "nstring" | "nint" | "hex64" | "object" | "pint";
+
+const PAYLOAD_FIELDS: Record<keyof DeliveryReceiptPayload, FieldType> = {
+  version: "int",
+  issuer: "string",
+  resourceUrl: "string",
+  method: "string",
+  scheme: "string",
+  network: "string",
+  asset: "string",
+  payTo: "string",
+  amount: "string",
+  payer: "string",
+  transaction: "string",
+  logIndex: "nint",
+  paymentId: "nstring",
+  responseStatus: "nint",
+  responseContentType: "nstring",
+  delivery: "object",
+  keyDirectoryEpoch: "pint",
+  keyDirectoryDigest: "hex64",
+  issuedAt: "int",
+};
+
+/**
+ * Type check of one payload field.
+ *
+ * @param v - Value
+ * @param t - Declared type
+ * @returns Whether the value has the type
+ */
+function hasType(v: unknown, t: FieldType): boolean {
+  const isInt = Number.isSafeInteger(v) && (v as number) >= 0;
+  switch (t) {
+    case "string":
+      return typeof v === "string";
+    case "int":
+      return isInt;
+    case "pint":
+      return isInt && (v as number) >= 1;
+    case "nstring":
+      return v === null || typeof v === "string";
+    case "nint":
+      return v === null || isInt;
+    case "hex64":
+      return typeof v === "string" && HEX64.test(v);
+    case "object":
+      return !!v && typeof v === "object" && !Array.isArray(v);
+  }
+}
+
+/**
+ * Structural check of the delivery commitment (§5.4, §5.6).
+ *
+ * @param d - Candidate commitment
+ * @returns Whether it is well-formed
+ */
+function deliveryOk(d: Record<string, unknown>): boolean {
+  const keys = Object.keys(d).sort().join(",");
+  if (d.mode === "body") return keys === "mode,sha256" && hasType(d.sha256, "hex64");
+  if (d.mode === "stream") {
+    return (
+      keys === "digest,frameCount,framing,mode" &&
+      hasType(d.digest, "hex64") &&
+      hasType(d.frameCount, "int") &&
+      typeof d.framing === "string" &&
+      d.framing.length > 0
+    );
+  }
+  return false;
+}
 
 /**
  * Structural check of the payload (§5.2): exactly the v1 fields, with the declared types.
@@ -131,20 +212,12 @@ const PAYLOAD_FIELDS: Record<keyof DeliveryReceiptPayload, "string" | "int" | "n
 function payloadError(p: unknown): string | null {
   if (!p || typeof p !== "object" || Array.isArray(p)) return "PAYLOAD_INVALID";
   const obj = p as Record<string, unknown>;
-  const keys = Object.keys(obj);
-  if (keys.length !== Object.keys(PAYLOAD_FIELDS).length) return "PAYLOAD_FIELDS";
+  if (Object.keys(obj).length !== Object.keys(PAYLOAD_FIELDS).length) return "PAYLOAD_FIELDS";
   for (const [k, t] of Object.entries(PAYLOAD_FIELDS)) {
-    const v = obj[k];
-    const isInt = Number.isSafeInteger(v) && (v as number) >= 0;
-    const ok =
-      (t === "string" && typeof v === "string") ||
-      (t === "int" && isInt) ||
-      (t === "nstring" && (v === null || typeof v === "string")) ||
-      (t === "nint" && (v === null || isInt));
-    if (!ok) return `PAYLOAD_FIELD_${k}`;
+    if (!hasType(obj[k], t)) return `PAYLOAD_FIELD_${k}`;
   }
   if (obj.version !== 1) return "PAYLOAD_VERSION";
-  if (!HEX64.test(obj.responseSha256 as string)) return "PAYLOAD_FIELD_responseSha256";
+  if (!deliveryOk(obj.delivery as Record<string, unknown>)) return "PAYLOAD_FIELD_delivery";
   if ((obj.transaction as string).length === 0) return "PAYLOAD_FIELD_transaction";
   try {
     if (new URL(obj.issuer as string).origin !== obj.issuer) return "PAYLOAD_FIELD_issuer";
@@ -152,6 +225,32 @@ function payloadError(p: unknown): string | null {
   } catch {
     return "PAYLOAD_URL";
   }
+  return null;
+}
+
+/**
+ * Structural check of `signatures[]` (§5.3): 2–4 entries, distinct registered algs, both
+ * baseline algorithms present, canonical base64 of the right length.
+ *
+ * @param list - Candidate list
+ * @returns Reason code or null
+ */
+function signaturesError(list: unknown): string | null {
+  if (!Array.isArray(list) || list.length < 2 || list.length > 4) return "SIGNATURES_SHAPE";
+  const seen = new Set<string>();
+  for (const s of list) {
+    if (!s || typeof s !== "object" || Object.keys(s).length !== 3) return "SIGNATURES_SHAPE";
+    const e = s as Record<string, unknown>;
+    const suite = getAlgorithm(e.alg);
+    if (!suite) return "ALG_UNSUPPORTED";
+    if (seen.has(e.alg as string)) return "SIGNATURES_DUPLICATE_ALG";
+    seen.add(e.alg as string);
+    if (typeof e.kid !== "string" || e.kid.length === 0) return "KID_INVALID";
+    const sig = fromCanonicalBase64(e.signature);
+    if (!sig || sig.length !== suite.signatureBytes) return "SIGNATURE_ENCODING";
+  }
+  if (!seen.has(SESSION_ALGORITHM) || !seen.has(ARCHIVAL_ALGORITHM))
+    return "SIGNATURE_PAIR_MISSING";
   return null;
 }
 
@@ -169,10 +268,28 @@ function settlementMismatches(
   payload: DeliveryReceiptPayload,
   e: ReceiptExpectations,
 ): string[] | null {
-  if (!e.settle && !e.requirements && !e.resourceUrl && !e.method && e.paymentId === undefined) {
+  if (
+    !e.settle &&
+    !e.requirements &&
+    !e.resourceUrl &&
+    !e.method &&
+    e.paymentId === undefined &&
+    !e.offerReceipt
+  ) {
     return null;
   }
   const checks: [string, boolean][] = [];
+  if (e.offerReceipt) {
+    // Composition with offer-receipt (§2.1): both receipts describe the same payment.
+    checks.push(
+      ["offer-receipt.network", payload.network === e.offerReceipt.network],
+      ["offer-receipt.payer", sameAddress(payload.payer, e.offerReceipt.payer)],
+      [
+        "offer-receipt.transaction",
+        e.offerReceipt.transaction === null || payload.transaction === e.offerReceipt.transaction,
+      ],
+    );
+  }
   if (e.settle) {
     checks.push(
       ["transaction", payload.transaction === e.settle.transaction],
@@ -194,28 +311,46 @@ function settlementMismatches(
   if (e.method !== undefined) checks.push(["method", payload.method === e.method.toUpperCase()]);
   if (e.paymentId !== undefined)
     checks.push(["paymentId", payload.paymentId === (e.paymentId ?? null)]);
-  return checks.filter(([, ok]) => !ok).map(([field]) => field);
+  return [...new Set(checks.filter(([, ok]) => !ok).map(([field]) => field))];
 }
 
 /**
- * Delivery binding: body digest and (when signed) status.
+ * Delivery binding: body digest or stream digest, and (when signed) status. Returns null when
+ * nothing was observed.
  *
  * @param payload - Receipt payload
- * @param body - Body bytes received
- * @param status - Observed HTTP status
- * @returns Reason codes (empty when delivery matches)
+ * @param e - What the client observed
+ * @returns Reason codes (empty when delivery matches), or null if not evaluated
  */
 async function deliveryMismatches(
   payload: DeliveryReceiptPayload,
-  body: Uint8Array,
-  status: number | undefined,
-): Promise<string[]> {
+  e: ReceiptExpectations,
+): Promise<string[] | null> {
+  const d = payload.delivery;
   const codes: string[] = [];
-  if ((await sha256Hex(body)) !== payload.responseSha256) codes.push("BODY_DIGEST_MISMATCH");
+  if (e.responseBody) {
+    if (d.mode !== "body") codes.push("DELIVERY_MODE_MISMATCH");
+    else if ((await sha256Hex(e.responseBody)) !== d.sha256) codes.push("BODY_DIGEST_MISMATCH");
+  } else if (e.frames || e.trailer) {
+    if (d.mode !== "stream") {
+      codes.push("DELIVERY_MODE_MISMATCH");
+    } else {
+      if (e.trailer && (e.trailer.frameCount !== d.frameCount || e.trailer.digest !== d.digest)) {
+        codes.push("STREAM_TRAILER_MISMATCH");
+      }
+      if (e.frames) {
+        const got = await computeStreamDigest(e.frames);
+        if (got.frameCount !== d.frameCount) codes.push("STREAM_FRAME_COUNT_MISMATCH");
+        if (got.digest !== d.digest) codes.push("STREAM_DIGEST_MISMATCH");
+      }
+    }
+  } else {
+    return null;
+  }
   if (
     payload.responseStatus !== null &&
-    status !== undefined &&
-    payload.responseStatus !== status
+    e.responseStatus !== undefined &&
+    payload.responseStatus !== e.responseStatus
   ) {
     codes.push("STATUS_MISMATCH");
   }
@@ -223,11 +358,48 @@ async function deliveryMismatches(
 }
 
 /**
+ * Evaluates the settlement and delivery levels into `levels`/`reasons`.
+ *
+ * @param payload - Receipt payload
+ * @param e - What the client observed
+ * @param levels - Levels to update
+ * @param reasons - Reasons to append to
+ * @param done - Builds the verdict
+ * @returns The verdict
+ */
+async function evaluateBindings(
+  payload: DeliveryReceiptPayload,
+  e: ReceiptExpectations,
+  levels: ReceiptVerificationLevels,
+  reasons: ReceiptVerificationResult["reasons"],
+  done: () => ReceiptVerificationResult,
+): Promise<ReceiptVerificationResult> {
+  const mism = settlementMismatches(payload, e);
+  if (mism) {
+    levels.settlement = mism.length === 0;
+    for (const m of mism) {
+      reasons.push({
+        level: "settlement",
+        code: m.startsWith("offer-receipt.") ? "OFFER_RECEIPT_MISMATCH" : "SETTLEMENT_MISMATCH",
+        detail: m,
+      });
+    }
+  }
+  const codes = await deliveryMismatches(payload, e);
+  if (codes) {
+    levels.delivery = codes.length === 0;
+    for (const code of codes) reasons.push({ level: "delivery", code });
+  }
+  return done();
+}
+
+/**
  * Verifies a delivery receipt (§8). Never throws.
  *
- * Levels `integrity`, `authentic` and `trusted` are always evaluated. `settlement` is evaluated
- * when `expected.settle` or `expected.requirements` is given; `delivery` when
- * `expected.responseBody` is given. `valid` requires every evaluated level to pass.
+ * Levels `integrity`, `authentic` and `trusted` are always evaluated, on the requested path.
+ * `settlement` is evaluated when settlement facts are given; `delivery` when a body, frames or a
+ * trailer are given. `valid` requires every evaluated level to pass. `longTermEvidence` is true
+ * only on the archival path.
  *
  * @param input - Receipt wire object (parsed JSON)
  * @param options - Verification options
@@ -237,6 +409,7 @@ export async function verifyDeliveryReceipt(
   input: unknown,
   options: VerifyDeliveryReceiptOptions,
 ): Promise<ReceiptVerificationResult> {
+  const path: VerificationPath = options.path ?? "archival";
   const levels: ReceiptVerificationLevels = {
     integrity: false,
     authentic: null,
@@ -245,102 +418,119 @@ export async function verifyDeliveryReceipt(
     delivery: null,
   };
   const reasons: ReceiptVerificationResult["reasons"] = [];
+  const signaturesVerified: ReceiptVerificationResult["signaturesVerified"] = [];
   let receiptId: string | null = null;
   let trustBasis: ReceiptVerificationResult["trustBasis"] = "none";
-  const done = (): ReceiptVerificationResult => ({
-    valid:
+  let directoryEpoch: number | null = null;
+  let latestDirectoryEpoch: number | null = null;
+  const done = (): ReceiptVerificationResult => {
+    const valid =
       levels.integrity === true &&
       levels.authentic === true &&
       levels.trusted === true &&
       levels.settlement !== false &&
-      levels.delivery !== false,
-    levels,
-    receiptId,
-    trustBasis,
-    reasons,
-  });
+      levels.delivery !== false;
+    return {
+      valid,
+      path,
+      longTermEvidence: path === "archival" && levels.authentic === true && levels.trusted === true,
+      signaturesVerified,
+      levels,
+      receiptId,
+      trustBasis,
+      directoryEpoch,
+      latestDirectoryEpoch,
+      reasons,
+    };
+  };
 
   try {
     // ── integrity ──
     const r = input as Partial<DeliveryReceipt> | null;
-    if (!r || typeof r !== "object" || Object.keys(r).length !== 4) {
+    if (!r || typeof r !== "object" || Object.keys(r).length !== 2) {
       reasons.push({ level: "integrity", code: "RECEIPT_SHAPE" });
       return done();
     }
-    const suite = getAlgorithm(r.alg);
-    const sig = fromCanonicalBase64(r.signature);
+    const sErr = signaturesError(r.signatures);
     const pErr = payloadError(r.payload);
-    if (!suite)
-      reasons.push({ level: "integrity", code: "ALG_UNSUPPORTED", detail: String(r.alg) });
-    if (typeof r.kid !== "string") reasons.push({ level: "integrity", code: "KID_INVALID" });
-    if (!sig || (suite && sig.length !== suite.signatureBytes)) {
-      reasons.push({ level: "integrity", code: "SIGNATURE_ENCODING" });
-    }
+    if (sErr) reasons.push({ level: "integrity", code: sErr });
     if (pErr) reasons.push({ level: "integrity", code: pErr });
     if (reasons.length) return done();
     const payload = r.payload as DeliveryReceiptPayload;
     receiptId = await computeReceiptId(payload);
     levels.integrity = true;
+    directoryEpoch = payload.keyDirectoryEpoch;
 
-    // ── directory + key lookup ──
-    const dirRes = await verifyKeyDirectory(options.directory, {
+    // ── directory chain (§7.5) ──
+    const alg = pathAlgorithm(path);
+    const sigEntry = r.signatures!.find(s => s.alg === alg)!;
+    const docs = options.directories ?? (options.directory ? [options.directory] : []);
+    const chain = await verifyKeyDirectoryChain(docs, payload.keyDirectoryEpoch, {
       ...options.directoryTrust,
       expectedIssuer: payload.issuer,
+      path,
     });
-    const entry = dirRes.directory?.keys.find(k => k.kid === r.kid);
+    const skew = options.skewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS;
+    const entry = chain.directory?.keys.find(k => k.kid === sigEntry.kid);
 
-    // ── authentic ──
-    if (!dirRes.ok || !entry) {
+    if (!chain.ok || !chain.directory || !entry) {
       levels.authentic = false;
       levels.trusted = false;
       reasons.push(
-        dirRes.ok
-          ? { level: "authentic", code: "KEY_NOT_LISTED", detail: r.kid }
-          : { level: "trusted", code: dirRes.code ?? "DIRECTORY_INVALID", detail: dirRes.detail },
+        chain.ok
+          ? { level: "authentic", code: "KEY_NOT_LISTED", detail: sigEntry.kid }
+          : { level: "trusted", code: chain.code ?? "DIRECTORY_INVALID", detail: chain.detail },
       );
-    } else {
-      const pk = fromCanonicalBase64(entry.publicKey)!;
-      levels.authentic =
-        entry.alg === r.alg &&
-        verifySignature(r.alg as ReceiptAlgorithm, pk, receiptSignedMessage(receiptId), sig!);
-      if (!levels.authentic) reasons.push({ level: "authentic", code: "SIGNATURE_INVALID" });
-
-      // ── trusted ──
-      trustBasis = dirRes.trustBasis;
-      const now = options.now ?? Math.floor(Date.now() / 1000);
-      const keyErr = keyAuthorizationError(
-        entry,
-        r.alg as string,
-        payload.issuedAt,
-        now,
-        options.skewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS,
-      );
-      const resourceOrigin = new URL(payload.resourceUrl).origin;
-      const issuerOk =
-        payload.issuer === resourceOrigin ||
-        (options.acceptedIssuers ?? []).some(i => new URL(i).origin === payload.issuer);
-      if (keyErr) reasons.push({ level: "trusted", code: keyErr });
-      if (!issuerOk) {
-        reasons.push({ level: "trusted", code: "ISSUER_NOT_AUTHORIZED", detail: payload.issuer });
-      }
-      levels.trusted = levels.authentic && !keyErr && issuerOk;
+      return await evaluateBindings(payload, options.expected ?? {}, levels, reasons, done);
     }
 
-    // ── settlement / delivery ──
-    const e = options.expected ?? {};
-    const mism = settlementMismatches(payload, e);
-    if (mism) {
-      levels.settlement = mism.length === 0;
-      for (const m of mism) {
-        reasons.push({ level: "settlement", code: "SETTLEMENT_MISMATCH", detail: m });
-      }
+    // ── authentic ──
+    const verified =
+      entry.alg === alg
+        ? await verifySignatureWithEngine(
+            alg,
+            fromCanonicalBase64(entry.publicKey)!,
+            receiptSignedMessage(receiptId),
+            fromCanonicalBase64(sigEntry.signature)!,
+          )
+        : { ok: false, engine: "none" };
+    levels.authentic = verified.ok;
+    if (verified.ok) signaturesVerified.push({ alg, kid: sigEntry.kid, engine: verified.engine });
+    else reasons.push({ level: "authentic", code: "SIGNATURE_INVALID", detail: alg });
+
+    // ── trusted ──
+    trustBasis = chain.trustBasis;
+    latestDirectoryEpoch = chain.latest!.epoch;
+    const now = options.now ?? Math.floor(Date.now() / 1000);
+    const trustCodes: string[] = [];
+    if (chain.directory.root !== payload.keyDirectoryDigest) {
+      trustCodes.push("KEY_DIRECTORY_DIGEST_MISMATCH");
     }
-    if (e.responseBody) {
-      const codes = await deliveryMismatches(payload, e.responseBody, e.responseStatus);
-      levels.delivery = codes.length === 0;
-      for (const code of codes) reasons.push({ level: "delivery", code });
+    if (chain.directory.publishedAt > payload.issuedAt + skew) {
+      trustCodes.push("KEY_DIRECTORY_NOT_IN_FORCE");
     }
-    return done();
+    if (chain.successor && chain.successor.publishedAt + skew < payload.issuedAt) {
+      trustCodes.push("KEY_DIRECTORY_SUPERSEDED");
+    }
+    const latestEntry = chain.latest!.keys.find(k => k.kid === sigEntry.kid)!;
+    for (const e of latestEntry === entry ? [entry] : [entry, latestEntry]) {
+      const keyErr = keyAuthorizationError(e, alg, payload.issuedAt, now, skew);
+      if (keyErr && !trustCodes.includes(keyErr)) trustCodes.push(keyErr);
+    }
+    const resourceOrigin = new URL(payload.resourceUrl).origin;
+    const issuerOk =
+      payload.issuer === resourceOrigin ||
+      (options.acceptedIssuers ?? []).some(i => new URL(i).origin === payload.issuer);
+    if (!issuerOk) trustCodes.push("ISSUER_NOT_AUTHORIZED");
+    for (const code of trustCodes) {
+      reasons.push({
+        level: "trusted",
+        code,
+        ...(code === "ISSUER_NOT_AUTHORIZED" ? { detail: payload.issuer } : {}),
+      });
+    }
+    levels.trusted = levels.authentic && trustCodes.length === 0;
+    return await evaluateBindings(payload, options.expected ?? {}, levels, reasons, done);
   } catch (error) {
     reasons.push({
       level: "integrity",
@@ -351,11 +541,107 @@ export async function verifyDeliveryReceipt(
   }
 }
 
+/**
+ * Verifies a paid SSE stream end to end: splits the event-stream text into content frames and the
+ * terminal frame, resolves the receipt, and checks the running digest, the frame count and the
+ * receipt (§5.6). Alteration, reordering, insertion and truncation of frames are all detected.
+ *
+ * @param text - The full event-stream text received
+ * @param options - Verification options (as {@link verifyDeliveryReceipt}); `expected.frames` and
+ *   `expected.trailer` are filled in from the stream
+ * @param fetchImpl - fetch implementation, used only for receipts delivered by reference
+ * @returns Verdict
+ */
+export async function verifySseDelivery(
+  text: string,
+  options: VerifyDeliveryReceiptOptions,
+  fetchImpl: typeof fetch = fetch,
+): Promise<ReceiptVerificationResult> {
+  const { frames, trailer, eventsAfterTrailer } = splitSseStream(parseSse(text));
+  const base = await verifyDeliveryReceiptOrMissing(trailer, options, frames, fetchImpl);
+  if (eventsAfterTrailer > 0) {
+    base.reasons.push({ level: "delivery", code: "STREAM_EVENTS_AFTER_TRAILER" });
+    base.levels.delivery = false;
+    base.valid = false;
+  }
+  return base;
+}
+
+/**
+ * Resolves the receipt from a trailer (inline or by reference) and verifies it with the frames.
+ *
+ * @param trailer - Parsed trailer, or null if the stream ended without one
+ * @param options - Verification options
+ * @param frames - Content frames received
+ * @param fetchImpl - fetch implementation
+ * @returns Verdict
+ */
+async function verifyDeliveryReceiptOrMissing(
+  trailer: StreamTrailer | null,
+  options: VerifyDeliveryReceiptOptions,
+  frames: string[],
+  fetchImpl: typeof fetch,
+): Promise<ReceiptVerificationResult> {
+  if (!trailer || typeof trailer !== "object") {
+    return failedResult(options.path ?? "archival", "STREAM_TRAILER_MISSING");
+  }
+  let receipt: DeliveryReceipt;
+  try {
+    receipt = await resolveDeliveryReceipt(trailer as DeliveryReceiptSettleInfo, fetchImpl);
+  } catch (error) {
+    return failedResult(
+      options.path ?? "archival",
+      "RECEIPT_UNAVAILABLE",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+  return verifyDeliveryReceipt(receipt, {
+    ...options,
+    expected: {
+      ...options.expected,
+      frames,
+      trailer: { frameCount: trailer.frameCount, digest: trailer.digest },
+    },
+  });
+}
+
+/**
+ * A verdict for a receipt that could not be obtained.
+ *
+ * @param path - Verification path
+ * @param code - Reason code
+ * @param detail - Optional detail
+ * @returns Failed verdict
+ */
+function failedResult(
+  path: VerificationPath,
+  code: string,
+  detail?: string,
+): ReceiptVerificationResult {
+  return {
+    valid: false,
+    path,
+    longTermEvidence: false,
+    signaturesVerified: [],
+    levels: { integrity: false, authentic: null, trusted: null, settlement: null, delivery: null },
+    receiptId: null,
+    trustBasis: "none",
+    directoryEpoch: null,
+    latestDirectoryEpoch: null,
+    reasons: [{ level: "integrity", code, ...(detail ? { detail } : {}) }],
+  };
+}
+
 export interface DeliveryReceiptFetchOptions {
   /** Base64 governance keys trusted out of band (recommended). Without them trust is "tls". */
   pinnedGovernanceKeys?: string[];
   /** Extra accepted issuers (e.g. a notary origin). */
   acceptedIssuers?: string[];
+  /**
+   * Signature path checked in session. Default `session` (Ed25519, WebCrypto where available).
+   * Use `archival` to verify the ML-DSA-65 signature as well when the runtime allows it.
+   */
+  path?: VerificationPath;
   /** Called with the verdict of every paid response that declared or carried a receipt. */
   onResult?: (
     result: ReceiptVerificationResult,
@@ -382,17 +668,47 @@ export function getDeliveryReceiptResult(
 }
 
 /**
+ * Reads the `offer-receipt` receipt payload from a SettleResponse, when present (§2.1). Only the
+ * fields needed for the composition rule are returned; verifying the offer-receipt signature is
+ * the job of the offer-receipt verifier.
+ *
+ * @param settle - Decoded SettleResponse
+ * @returns `{ network, payer, transaction }` or null when no readable offer-receipt is present
+ */
+export function offerReceiptFacts(
+  settle: SettleResponse | undefined | null,
+): OfferReceiptFacts | null {
+  const receipt = (
+    settle?.extensions as Record<string, { info?: { receipt?: unknown } }> | undefined
+  )?.[OFFER_RECEIPT]?.info?.receipt;
+  if (!receipt || typeof receipt !== "object") return null;
+  try {
+    const p = extractReceiptPayload(receipt as SignedReceipt);
+    if (typeof p?.network !== "string" || typeof p?.payer !== "string") return null;
+    return {
+      network: p.network,
+      payer: p.payer,
+      transaction: typeof p.transaction === "string" && p.transaction !== "" ? p.transaction : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Wraps the BASE fetch passed to `wrapFetchWithPayment` so that every paid response is checked
  * against the payment the client actually sent:
  *
  * ```ts
  * const fetchWithPay = wrapFetchWithPayment(withDeliveryReceipts(fetch, { pinnedGovernanceKeys }), client);
  * const res = await fetchWithPay(url);
- * getDeliveryReceiptResult(res); // { valid, levels, reasons, ... }
+ * getDeliveryReceiptResult(res); // { valid, path, levels, reasons, ... }
  * ```
  *
  * Sitting under the payment wrapper gives access to the PAYMENT-SIGNATURE request header (the
  * accepted requirements and the echoed declaration) and to the PAYMENT-RESPONSE header and body.
+ * Streamed routes (`deliveryMode: "stream"`) are passed through untouched: their receipt arrives in
+ * the terminal frame, so verify them with {@link verifySseDelivery} once the stream is consumed.
  *
  * @param baseFetch - The fetch that performs network I/O
  * @param options - Verification options
@@ -402,7 +718,8 @@ export function withDeliveryReceipts(
   baseFetch: typeof fetch,
   options: DeliveryReceiptFetchOptions = {},
 ): typeof fetch {
-  const directoryCache = new Map<string, Promise<unknown>>();
+  const directoryCache = new Map<string, Promise<unknown[]>>();
+  const path = options.path ?? "session";
 
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
     const request = new Request(input, init);
@@ -422,26 +739,17 @@ export function withDeliveryReceipts(
       return response;
     }
     const declared = (
-      paymentPayload.extensions as Record<string, { info?: { keyDirectory?: string } }>
+      paymentPayload.extensions as
+        | Record<string, { info?: Partial<DeliveryReceiptDeclarationInfo> }>
+        | undefined
     )?.[DELIVERY_RECEIPT];
+    if (declared?.info?.deliveryMode === "stream") return response;
     const info = extractDeliveryReceipt(settle);
     if (!declared && !info) return response;
 
     let result: ReceiptVerificationResult;
     if (!info || !settle.success) {
-      result = {
-        valid: false,
-        levels: {
-          integrity: false,
-          authentic: null,
-          trusted: null,
-          settlement: null,
-          delivery: null,
-        },
-        receiptId: null,
-        trustBasis: "none",
-        reasons: [{ level: "integrity", code: "RECEIPT_MISSING" }],
-      };
+      result = failedResult(path, "RECEIPT_MISSING");
     } else {
       try {
         const receipt = await resolveDeliveryReceipt(info, baseFetch);
@@ -451,20 +759,22 @@ export function withDeliveryReceipts(
           (declared?.info?.keyDirectory && new URL(declared.info.keyDirectory).origin === issuer
             ? declared.info.keyDirectory
             : new URL(KEY_DIRECTORY_WELL_KNOWN_PATH, issuer).toString());
-        if (!directoryCache.has(dirUrl)) {
-          const p = fetchKeyDirectory(dirUrl, baseFetch);
-          p.catch(() => directoryCache.delete(dirUrl));
-          directoryCache.set(dirUrl, p);
+        const cacheKey = `${dirUrl}#${receipt.payload.keyDirectoryEpoch}`;
+        if (!directoryCache.has(cacheKey)) {
+          const p = fetchKeyDirectoryChain(dirUrl, receipt.payload.keyDirectoryEpoch, baseFetch);
+          p.catch(() => directoryCache.delete(cacheKey));
+          directoryCache.set(cacheKey, p);
         }
         const body = new Uint8Array(await response.clone().arrayBuffer());
         const paymentId = (
           paymentPayload.extensions as Record<string, { info?: { id?: unknown } }> | undefined
         )?.["payment-identifier"]?.info?.id;
         result = await verifyDeliveryReceipt(receipt, {
-          directory: await directoryCache.get(dirUrl),
+          directories: await directoryCache.get(cacheKey),
           directoryTrust: options.pinnedGovernanceKeys
             ? { pinnedGovernanceKeys: options.pinnedGovernanceKeys }
             : undefined,
+          path,
           acceptedIssuers: options.acceptedIssuers,
           expected: {
             settle,
@@ -474,28 +784,15 @@ export function withDeliveryReceipts(
             paymentId: typeof paymentId === "string" ? paymentId : null,
             responseBody: body,
             responseStatus: response.status,
+            offerReceipt: offerReceiptFacts(settle) ?? undefined,
           },
         });
       } catch (error) {
-        result = {
-          valid: false,
-          levels: {
-            integrity: false,
-            authentic: null,
-            trusted: null,
-            settlement: null,
-            delivery: null,
-          },
-          receiptId: null,
-          trustBasis: "none",
-          reasons: [
-            {
-              level: "integrity",
-              code: "RECEIPT_UNAVAILABLE",
-              detail: error instanceof Error ? error.message : String(error),
-            },
-          ],
-        };
+        result = failedResult(
+          path,
+          "RECEIPT_UNAVAILABLE",
+          error instanceof Error ? error.message : String(error),
+        );
       }
     }
     results.set(response, result);

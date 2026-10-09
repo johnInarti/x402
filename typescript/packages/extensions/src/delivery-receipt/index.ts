@@ -1,8 +1,10 @@
 /**
  * x402 Delivery-Receipt Extension
  *
- * Signed receipts that bind an x402 settlement to the exact response that was served,
- * with a declared signature algorithm (ml-dsa-65 baseline) and a signed key directory.
+ * Signed receipts that bind an x402 settlement to the exact response (or stream of frames) that
+ * was served. Every receipt carries an Ed25519 signature for in-session verification and an
+ * ML-DSA-65 signature over the same message for archival verification, and names the key
+ * directory epoch it was issued under.
  *
  * Spec: specs/extensions/delivery-receipt.md
  */
@@ -19,6 +21,9 @@ export {
 export {
   SUPPORTED_ALGORITHMS,
   verifySignature,
+  verifySignatureWithEngine,
+  hasWebCryptoEd25519,
+  type VerifyEngine,
   deriveKid,
   generateReceiptKeyPair,
   createLocalReceiptSigner,
@@ -26,7 +31,13 @@ export {
 } from "./algorithms";
 export {
   DEFAULT_CLOCK_SKEW_SECONDS,
+  MAX_CHAIN_EPOCHS,
   computeDirectoryRoot,
+  keyDirectoryEpochUrl,
+  verifyKeyDirectoryChain,
+  fetchKeyDirectoryChain,
+  pathAlgorithm,
+  type DirectoryChainResult,
   directorySignedMessage,
   buildKeyDirectory,
   activeKeyEntry,
@@ -41,6 +52,12 @@ export {
   SETTLE_INFO_SCHEMA,
   buildDeclarationInfo,
   buildReceiptPayload,
+  createReceiptPayload,
+  createSseReceiptWriter,
+  type DirectorySource,
+  type ReceiptFacts,
+  type SseReceiptContext,
+  type SseReceiptWriter,
   publicResourceUrl,
   signDeliveryReceipt,
   createDeliveryReceiptExtension,
@@ -52,9 +69,21 @@ export {
   extractDeliveryReceipt,
   resolveDeliveryReceipt,
   verifyDeliveryReceipt,
+  verifySseDelivery,
+  offerReceiptFacts,
   withDeliveryReceipts,
+  type OfferReceiptFacts,
   getDeliveryReceiptResult,
   type ReceiptExpectations,
   type VerifyDeliveryReceiptOptions,
   type DeliveryReceiptFetchOptions,
 } from "./client";
+export {
+  StreamDigest,
+  computeStreamDigest,
+  formatSseEvent,
+  formatSseTrailer,
+  parseSse,
+  splitSseStream,
+  type SseEvent,
+} from "./stream";

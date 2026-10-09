@@ -18,7 +18,7 @@ signed object:
 - the economic terms that were paid — `scheme`, `asset`, `payTo`, `amount`, `payer`;
 - the resource — `resourceUrl`, HTTP `method`;
 - the served bytes — `responseSha256`, the SHA-256 of the exact response body the client received, plus the
-  response status;
+  content type and (when available) the response status;
 - the issuance time and the issuer.
 
 Receipts are signed with a declared algorithm. `ml-dsa-65` (NIST FIPS 204) is the baseline every verifier MUST
@@ -131,7 +131,7 @@ A receipt MUST NOT be returned for a failed settle (`success: false`).
 | `transaction` | string | Yes | `SettleResponse.transaction`. MUST be non-empty. |
 | `logIndex` | integer \| null | Yes | Block-level index of the transfer log of `transaction` that paid `payTo`, when the server resolved it; otherwise `null`. |
 | `paymentId` | string \| null | Yes | The `payment-identifier` extension `id` sent by the client, if any; otherwise `null`. |
-| `responseStatus` | integer | Yes | HTTP status code of the served response. |
+| `responseStatus` | integer \| null | Yes | HTTP status code of the served response, or `null` when the server's x402 integration does not expose it (the reference HTTP integrations only settle for status < 400). |
 | `responseSha256` | string | Yes | Lowercase hex SHA-256 of the response body bytes (§5.4). |
 | `responseContentType` | string \| null | Yes | `Content-Type` of the served response, or `null`. |
 | `issuedAt` | integer | Yes | Unix time (seconds) at which the receipt was signed. |
@@ -302,7 +302,7 @@ A verifier evaluates, and reports separately:
 | `authentic` | The signature verifies over the signed message under the public key of `kid` in the directory. |
 | `trusted` | The directory verifies (§7.3), the key authorizes the receipt (§7.4), and the issuer is authorized for the resource (§8.2). |
 | `settlement` | The payload matches the settlement the client observed (§8.3). |
-| `delivery` | `responseSha256` equals the digest of the body the client received, and `responseStatus` equals the observed status. |
+| `delivery` | `responseSha256` equals the digest of the body the client received, and `responseStatus`, when not `null`, equals the observed status. |
 
 A receipt is **valid for the client** only if all five levels pass. An offline third party that has the receipt,
 the directory and the body can evaluate `integrity`, `authentic`, `trusted` and `delivery`; `settlement` can then be

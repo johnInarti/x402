@@ -46,6 +46,7 @@
   },
   "dependencies": {
     "@noble/curves": "^1.9.0",
+    "@noble/post-quantum": "^0.6.1",
     "@scure/base": "^1.2.6",
     "@signinwithethereum/siwe": "^4.1.0",
     "@x402/core": "workspace:~",
@@ -114,6 +115,16 @@
       "require": {
         "types": "./dist/cjs/builder-code/index.d.ts",
         "default": "./dist/cjs/builder-code/index.js"
+      }
+    },
+    "./delivery-receipt": {
+      "import": {
+        "types": "./dist/esm/delivery-receipt/index.d.mts",
+        "default": "./dist/esm/delivery-receipt/index.mjs"
+      },
+      "require": {
+        "types": "./dist/cjs/delivery-receipt/index.d.ts",
+        "default": "./dist/cjs/delivery-receipt/index.js"
       }
     }
   },

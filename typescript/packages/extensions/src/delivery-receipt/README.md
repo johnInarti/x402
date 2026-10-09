@@ -1,11 +1,22 @@
 # x402 Delivery-Receipt Extension
 
-Spec: [`specs/extensions/delivery-receipt.md`](../../../../../specs/extensions/delivery-receipt.md)
+Spec: [`specs/extensions/delivery-receipt.md`](../../../../../specs/extensions/delivery-receipt.md) (draft v0.2,
+test vectors in Appendix A and `delivery-receipt.vectors.json`)
 
 After a successful settle, the resource server signs a receipt that binds the settlement
-(`network`, `transaction`, `logIndex`, `asset`, `payTo`, `amount`, `payer`) to the SHA-256 of the
-response body it served. Keys are published in a signed key directory
-(`/.well-known/x402-receipt-keys`), so a receipt can be verified offline later.
+(`network`, `transaction`, `logIndex`, `asset`, `payTo`, `amount`, `payer`) to the content it served:
+the SHA-256 of the response body, or, for SSE routes, the frame count and running digest of the frames.
+
+Every receipt carries two signatures over the same 88-byte message
+(`"x402-delivery-receipt/1\n" + receiptId`, where `receiptId` is the hex SHA-256 of `JCS(payload)`):
+
+- `ed25519` — the **session** path: clients verify it in the x402 session, with WebCrypto on Workers, Edge,
+  Deno and browsers.
+- `ml-dsa-65` (FIPS 204) — the **archival** path: required for anything kept as long-term evidence.
+
+The verdict says which path was taken (`path`, `longTermEvidence`). The payload names the key-directory
+epoch and digest it was signed under; the directory lives at a stable URL with immutable archives at
+`<keyDirectory>/epoch/<n>`.
 
 ## Server
 
@@ -20,20 +31,30 @@ import {
   activeKeyEntry,
 } from "@x402/extensions/delivery-receipt";
 
-const receiptKey = await generateReceiptKeyPair("ml-dsa-65", receiptSeed); // persist the seed
-const governanceKey = await generateReceiptKeyPair("ml-dsa-65", governanceSeed); // keep offline
+// Persist the seeds; keep the governance seeds offline.
+const keys = [
+  await generateReceiptKeyPair("ed25519", edSeed),
+  await generateReceiptKeyPair("ml-dsa-65", pqSeed),
+];
+const governance = [
+  await generateReceiptKeyPair("ed25519", govEdSeed),
+  await generateReceiptKeyPair("ml-dsa-65", govPqSeed),
+];
+const now = Math.floor(Date.now() / 1000);
 
-// Serve this JSON at https://api.example.com/.well-known/x402-receipt-keys
+// Serve at https://api.example.com/.well-known/x402-receipt-keys AND at .../epoch/1 (immutable).
 const directory = await buildKeyDirectory({
   issuer: "https://api.example.com",
-  governance: governanceKey,
-  keys: [activeKeyEntry(receiptKey, Math.floor(Date.now() / 1000))],
+  publishedAt: now,
+  governance,
+  keys: keys.map(k => activeKeyEntry(k, now)),
 });
 
 const server = new x402ResourceServer(facilitatorClient).registerExtension(
   createDeliveryReceiptExtension({
     issuer: "https://api.example.com",
-    signer: createLocalReceiptSigner(receiptKey),
+    signers: keys.map(createLocalReceiptSigner),
+    directory, // or () => currentDirectory()
   }),
 );
 
@@ -47,7 +68,17 @@ const routes = {
 ```
 
 The body is hashed from the buffer the HTTP middleware already keeps for settlement. Routes that
-settle before the handler runs get no receipt.
+settle before the handler runs get no body-mode receipt.
+
+### Streams (SSE)
+
+```ts
+import { createSseReceiptWriter } from "@x402/extensions/delivery-receipt";
+
+const writer = createSseReceiptWriter(config, { resourceUrl, method: "GET", requirements, settle });
+for await (const event of source) res.write(await writer.frame(JSON.stringify(event)));
+res.end((await writer.finish()).event); // terminal `x402-delivery-receipt` event with the receipt
+```
 
 ## Client
 
@@ -59,29 +90,33 @@ import { wrapFetchWithPayment } from "@x402/fetch";
 import { withDeliveryReceipts, getDeliveryReceiptResult } from "@x402/extensions/delivery-receipt";
 
 const fetchWithPayment = wrapFetchWithPayment(
-  withDeliveryReceipts(fetch, { pinnedGovernanceKeys: [governanceKeyB64] }),
+  withDeliveryReceipts(fetch, { pinnedGovernanceKeys: [govEdB64] }),
   client,
 );
 const res = await fetchWithPayment("https://api.example.com/premium-data");
 const verdict = getDeliveryReceiptResult(res);
-// { valid, levels: { integrity, authentic, trusted, settlement, delivery }, trustBasis, reasons }
+// { valid, path: "session", longTermEvidence: false, levels, trustBasis, reasons, ... }
 ```
 
 Without `pinnedGovernanceKeys` the directory is trusted on first use over TLS and the verdict
-reports `trustBasis: "tls"`.
+reports `trustBasis: "tls"`. When an `offer-receipt` receipt is in the same settle response, the
+verdict also checks that both describe the same payment. For streamed routes, call
+`verifySseDelivery(text, options)` on the event stream once it has been consumed.
 
-## Offline verification
+## Offline / archival verification
 
 ```ts
 import { verifyDeliveryReceipt } from "@x402/extensions/delivery-receipt";
 
 const verdict = await verifyDeliveryReceipt(receipt, {
-  directory, // saved copy of the issuer's key directory
-  directoryTrust: { pinnedGovernanceKeys: [governanceKeyB64] },
+  directories, // saved copy of the epoch the receipt names (plus later epochs, if any)
+  directoryTrust: { pinnedGovernanceKeys: [govPqB64] },
+  path: "archival", // default
   expected: { responseBody }, // optional: the bytes you kept
 });
+// verdict.longTermEvidence === true only on the archival path
 ```
 
-A valid receipt proves the issuer's authorized key signed that settlement locator and body digest.
-It does not prove the content is correct; check `transaction`/`logIndex` on chain to confirm the
-transfer itself.
+A valid receipt proves the issuer's authorized key signed that settlement locator and content
+commitment. It does not prove the content is correct; check `transaction`/`logIndex` on chain to
+confirm the transfer itself.

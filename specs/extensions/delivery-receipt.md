@@ -577,6 +577,13 @@ whose origin equals the origin of `resourceUrl`. A verifier MAY be configured wi
 (for example an independent notary that attests on behalf of a resource server); this MUST be explicit
 configuration, never inferred from the receipt.
 
+A verified receipt binds the **delivery** to the issuer's origin; it does not bind `payTo` to an operator identity.
+A client that also needs "who was paid" SHOULD verify that separately, for example with the `payee-name` extension
+(x402-foundation/wg-identity#36), and treat the two verdicts as independent: `payee-name` checks that the contacted
+origin and the accept's `payTo` are bound to one name; this extension checks that this origin delivered this result
+for this settlement. When both are present, the origin the client contacted, `payload.resourceUrl`'s origin and the
+name's `org.x402.origins` SHOULD all agree; a receipt is never evidence for a payee binding on its own.
+
 ### 8.3 Settlement binding (client side)
 
 Inside the x402 session the client MUST check:
@@ -768,7 +775,7 @@ framing registered for that transport. Implementations MUST document what they h
 | Version | Date | Changes | Author |
 |---|---|---|---|
 | 0.1 | 2026-10-09 | Initial draft. | FractalAI (FRACTAL AI S.A.S.) |
-| 0.2.1 | 2026-10-10 | Decisions from public review (x402-foundation/x402#3758): receipts delivered **by reference by default** — `PAYMENT-RESPONSE` carries `{ receiptId, receiptUrl, digest }` within a stated 1 KB budget, the receipt is served immutable as JCS at a URL addressed by `receiptId`, `digest` checked before parsing, nothing in the body (§5.1, §5.5, §10); relationship to the legacy `x402-served` profile (§2.2); stream terminal values only in the terminal `x402-delivery-receipt` event (never an HTTP trailer), nested `reference`, browser `EventSource` rules, and a 15-minute SSE session fixture (§5.6, Appendix B). From a separate adversarial (red-team) review: no split verdict between paths (archival checks every signature); pinned verifiers enforce a remembered epoch; `valid` means five levels and never follows a verifier error; reference URLs checked before fetching; SSE CR normalisation, event-name and end-of-stream rules; registered framings only; `-0` and lone surrogates outside the signed subset; duplicate members MUST be rejected; epoch bounds fail instead of truncating; Ed25519 strict verification stated (§6.1). | FractalAI (FRACTAL AI S.A.S.) |
+| 0.2.1 | 2026-10-10 | Decisions from public review (x402-foundation/x402#3758): receipts delivered **by reference by default** — `PAYMENT-RESPONSE` carries `{ receiptId, receiptUrl, digest }` within a stated 1 KB budget, the receipt is served immutable as JCS at a URL addressed by `receiptId`, `digest` checked before parsing, nothing in the body (§5.1, §5.5, §10); relationship to the legacy `x402-served` profile (§2.2); stream terminal values only in the terminal `x402-delivery-receipt` event (never an HTTP trailer), nested `reference`, browser `EventSource` rules, and a 15-minute SSE session fixture (§5.6, Appendix B). From a separate adversarial (red-team) review: no split verdict between paths (archival checks every signature); pinned verifiers enforce a remembered epoch; `valid` means five levels and never follows a verifier error; reference URLs checked before fetching; SSE CR normalisation, event-name and end-of-stream rules; registered framings only; `-0` and lone surrogates outside the signed subset; duplicate members MUST be rejected; epoch bounds fail instead of truncating; Ed25519 strict verification stated (§6.1). | FractalAI (FRACTAL AI S.A.S.) Post-review addenda: §8.2 relationship to `payee-name` (delivery is not payee identity); Appendix A table of which runtime verified each row, plus an OpenSSL-only check. |
 | 0.2 | 2026-10-09 | From public review (x402-foundation/x402#3758): signed octets stated unambiguously with test vectors (Appendix A); `signatures[]` with an `ed25519` (session) + `ml-dsa-65` (archival) pair, directory signed by the same pair; `keyDirectoryEpoch`/`keyDirectoryDigest` in the payload, stable directory URL with per-epoch archives and chaining; stream mode; corrected `offer-receipt` framing and composition rule (§2, §2.1). The wire object of v0.1 (`alg`/`kid`/`signature`) is replaced; payload and domain identifiers stay at version 1 while the extension is a draft. | FractalAI (FRACTAL AI S.A.S.) |
 
 ## Appendix A. Test vectors
@@ -780,6 +787,20 @@ reference's structure, so agreement between the two shows that the vectors are r
 two independent designs agree. All values are exact. Keys are derived from the 32-octet `seed` (Ed25519: the seed is the RFC 8032 private
 key; ML-DSA: the seed is FIPS 204 `ξ`). Signatures were produced with deterministic signing; verify them rather than
 re-signing if your ML-DSA signer is hedged.
+
+**Which runtime checked what.** "The vectors pass" means different things per row, so each check is listed with
+the runtime that performed it:
+
+| Row | Reference + port (noble) | node:crypto / OpenSSL 3.5 (independent) | External review (#3758) |
+|---|---|---|---|
+| `ed25519` | id, message, key from seed, signature | id, message, key from seed, signature, tamper rejected, deterministic re-sign byte-identical | id, message, key from seed, signature |
+| `ml-dsa-65` | id, message, key from seed, signature | id, message, key from seed, signature, tamper rejected | id, message, sizes only (no ML-DSA in that runtime) |
+| `ml-dsa-87` | id, message, key from seed, signature | id, message, key from seed, signature, tamper rejected | id, message, sizes only |
+
+The OpenSSL check shares no code with the reference: it builds SPKI/PKCS#8 from the published bytes (RFC 8410,
+RFC 9881 seed form) and calls `crypto.verify`. It runs as `test/delivery-receipt-openssl.test.ts` and skips, rather
+than passes, rows its runtime cannot verify (ML-DSA needs OpenSSL >= 3.5, Node >= 24). A size check is never
+reported as a signature check.
 
 The same payload is used for every algorithm. `jcs` is the exact UTF-8 text of `JCS(payload)` (it is ASCII here),
 `receiptId` is the hex SHA-256 of those octets, and `messageHex` is the full 88-octet signed message.

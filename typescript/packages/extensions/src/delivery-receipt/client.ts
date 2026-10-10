@@ -15,7 +15,14 @@ import {
   verifyKeyDirectoryChain,
   type DirectoryVerificationOptions,
 } from "./directory";
-import { computeReceiptId, fromCanonicalBase64, receiptSignedMessage, sha256Hex } from "./encoding";
+import {
+  canonicalJson,
+  computeReceiptId,
+  fromCanonicalBase64,
+  parseJsonStrict,
+  receiptSignedMessage,
+  sha256Hex,
+} from "./encoding";
 import { computeStreamDigest, parseSse, splitSseStream } from "./stream";
 import {
   ARCHIVAL_ALGORITHM,
@@ -26,6 +33,7 @@ import {
   type DeliveryReceiptDeclarationInfo,
   type DeliveryReceiptPayload,
   type DeliveryReceiptSettleInfo,
+  type KeyDirectoryEntry,
   type ReceiptVerificationLevels,
   type ReceiptVerificationResult,
   type StreamTrailer,
@@ -33,6 +41,7 @@ import {
 } from "./types";
 
 const HEX64 = /^[0-9a-f]{64}$/;
+const REGISTERED_FRAMINGS = ["sse"];
 
 /**
  * Extracts the delivery-receipt info from a SettleResponse, if present and well-shaped.
@@ -51,29 +60,76 @@ export function extractDeliveryReceipt(
     return { receipt: info.receipt as DeliveryReceipt };
   }
   if (typeof info.receiptId === "string" && typeof info.receiptUrl === "string") {
-    return { receiptId: info.receiptId, receiptUrl: info.receiptUrl };
+    // A reference without a well-formed digest is still returned, so that it fails (closed) in
+    // resolveDeliveryReceipt instead of being mistaken for "no receipt".
+    return {
+      receiptId: info.receiptId,
+      receiptUrl: info.receiptUrl,
+      digest: typeof info.digest === "string" ? info.digest : "",
+    };
   }
   return null;
 }
 
 /**
- * Resolves a receipt delivered by reference (§5.5) and checks it is the one announced.
+ * Resolves a receipt delivered by reference (§5.5) and checks it is the one announced, in this
+ * order: the reference is well-formed and its URL is acceptable (before any fetch); the served
+ * octets hash to `digest` (before parsing); they are the canonical JCS text of a wire object
+ * (strict parse, no duplicate members); the payload hashes to `receiptId` and names the URL's
+ * origin as issuer. Only then is the receipt returned for verification.
  *
- * @param info - Settle info
+ * @param info - Settle info (inline receipt or reference)
  * @param fetchImpl - fetch implementation
+ * @param expectedIssuers - Origins the receipt may be fetched from (checked before fetching)
+ * @param maxBytes - Maximum size of the fetched receipt
  * @returns The receipt
  */
 export async function resolveDeliveryReceipt(
   info: DeliveryReceiptSettleInfo,
   fetchImpl: typeof fetch = fetch,
+  expectedIssuers?: string[],
+  maxBytes = 256 * 1024,
 ): Promise<DeliveryReceipt> {
   if ("receipt" in info) return info.receipt;
-  if (!HEX64.test(info.receiptId)) throw new Error("invalid receiptId");
+  if (typeof info.receiptId !== "string" || !HEX64.test(info.receiptId)) {
+    throw new Error("invalid receiptId");
+  }
+  if (typeof info.digest !== "string" || !HEX64.test(info.digest)) {
+    throw new Error("invalid reference digest");
+  }
+  // Decide whether to fetch BEFORE fetching: the URL comes from the server's response, so an
+  // unchecked fetch lets it point the client at any host (intranet, metadata service, …).
+  const u = new URL(info.receiptUrl);
+  const loopback = u.hostname === "localhost" || u.hostname === "127.0.0.1";
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && loopback)) {
+    throw new Error("receiptUrl must be https");
+  }
+  if (expectedIssuers && !expectedIssuers.some(i => new URL(i).origin === u.origin)) {
+    throw new Error("receiptUrl is not same-origin with an accepted issuer");
+  }
+  if (u.search || u.hash || u.pathname.split("/").pop() !== info.receiptId) {
+    throw new Error("receiptUrl is not addressed by receiptId");
+  }
   const res = await fetchImpl(info.receiptUrl, { redirect: "error" });
   if (!res.ok) throw new Error(`receipt fetch failed: HTTP ${res.status}`);
-  const receipt = (await res.json()) as DeliveryReceipt;
+  const buf = new Uint8Array(await res.arrayBuffer());
+  if (buf.length > maxBytes) throw new Error("referenced receipt too large");
+  // The digest is checked on the octets, before they are parsed or trusted.
+  if ((await sha256Hex(buf)) !== info.digest) {
+    throw new Error("referenced receipt does not match digest");
+  }
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  const receipt = parseJsonStrict(text, maxBytes) as DeliveryReceipt;
+  let canonical = false;
+  try {
+    canonical = canonicalJson(receipt) === text;
+  } catch {
+    canonical = false;
+  }
+  if (!canonical) throw new Error("referenced receipt is not served as JCS");
   if (
     !receipt?.payload ||
+    typeof receipt.payload !== "object" ||
     new URL(info.receiptUrl).origin !== receipt.payload.issuer ||
     (await computeReceiptId(receipt.payload)) !== info.receiptId
   ) {
@@ -129,6 +185,12 @@ export interface VerifyDeliveryReceiptOptions {
   /** Verifier clock (unix seconds). */
   now?: number;
   skewSeconds?: number;
+  /**
+   * Third-party / authenticity-only evaluation (§8.1): `settlement` (checked against the chain
+   * instead) and `delivery` (when the content is not at hand) may stay unevaluated. Without it,
+   * `valid` requires all five levels to pass — the client verdict of §8.1.
+   */
+  offline?: boolean;
 }
 
 type FieldType = "string" | "int" | "nstring" | "nint" | "hex64" | "object" | "pint";
@@ -196,8 +258,8 @@ function deliveryOk(d: Record<string, unknown>): boolean {
       keys === "digest,frameCount,framing,mode" &&
       hasType(d.digest, "hex64") &&
       hasType(d.frameCount, "int") &&
-      typeof d.framing === "string" &&
-      d.framing.length > 0
+      // Only registered framings: what the digest commits to depends on the framing (§5.6).
+      REGISTERED_FRAMINGS.includes(d.framing as string)
     );
   }
   return false;
@@ -254,8 +316,10 @@ function signaturesError(list: unknown): string | null {
   return null;
 }
 
-const sameAddress = (a: string, b: string): boolean =>
-  a === b || (/^0x[0-9a-fA-F]{40}$/.test(a) && a.toLowerCase() === b.toLowerCase());
+const sameAddress = (a: unknown, b: unknown): boolean =>
+  typeof a === "string" &&
+  typeof b === "string" &&
+  (a === b || (/^0x[0-9a-fA-F]{40}$/.test(a) && a.toLowerCase() === b.toLowerCase()));
 
 /**
  * Settlement binding (§8.3). Returns null when nothing was expected, else the mismatching fields.
@@ -308,7 +372,12 @@ function settlementMismatches(
   }
   if (e.resourceUrl !== undefined)
     checks.push(["resourceUrl", payload.resourceUrl === e.resourceUrl]);
-  if (e.method !== undefined) checks.push(["method", payload.method === e.method.toUpperCase()]);
+  if (e.method !== undefined) {
+    checks.push([
+      "method",
+      typeof e.method === "string" && payload.method === e.method.toUpperCase(),
+    ]);
+  }
   if (e.paymentId !== undefined)
     checks.push(["paymentId", payload.paymentId === (e.paymentId ?? null)]);
   return [...new Set(checks.filter(([, ok]) => !ok).map(([field]) => field))];
@@ -394,6 +463,55 @@ async function evaluateBindings(
 }
 
 /**
+ * Archival path (§6.1): verifies every signature other than the path's own.
+ *
+ * @param signatures - Receipt signatures
+ * @param pathAlg - Algorithm already verified by the path
+ * @param directory - Directory epoch named by the payload
+ * @param directory.keys - Its receipt keys
+ * @param receiptId - Receipt id
+ * @param verified - List of verified signatures to append to
+ * @param reasons - Reasons to append to
+ * @returns Whether all verified, and the directory entries of the verified keys
+ */
+async function verifyOtherSignatures(
+  signatures: DeliveryReceipt["signatures"],
+  pathAlg: string,
+  directory: { keys: KeyDirectoryEntry[] },
+  receiptId: string,
+  verified: ReceiptVerificationResult["signaturesVerified"],
+  reasons: ReceiptVerificationResult["reasons"],
+): Promise<{ ok: boolean; entries: { alg: string; entry: KeyDirectoryEntry }[] }> {
+  let ok = true;
+  const entries: { alg: string; entry: KeyDirectoryEntry }[] = [];
+  for (const s of signatures) {
+    if (s.alg === pathAlg) continue;
+    const e = directory.keys.find(k => k.kid === s.kid);
+    const v =
+      e && e.alg === s.alg
+        ? await verifySignatureWithEngine(
+            s.alg,
+            fromCanonicalBase64(e.publicKey)!,
+            receiptSignedMessage(receiptId),
+            fromCanonicalBase64(s.signature)!,
+          )
+        : { ok: false, engine: "none" };
+    if (v.ok && e) {
+      verified.push({ alg: s.alg, kid: s.kid, engine: v.engine });
+      entries.push({ alg: s.alg, entry: e });
+    } else {
+      ok = false;
+      reasons.push({
+        level: "authentic",
+        code: e ? "SIGNATURE_INVALID" : "KEY_NOT_LISTED",
+        detail: s.alg,
+      });
+    }
+  }
+  return { ok, entries };
+}
+
+/**
  * Verifies a delivery receipt (§8). Never throws.
  *
  * Levels `integrity`, `authentic` and `trusted` are always evaluated, on the requested path.
@@ -424,16 +542,26 @@ export async function verifyDeliveryReceipt(
   let directoryEpoch: number | null = null;
   let latestDirectoryEpoch: number | null = null;
   const done = (): ReceiptVerificationResult => {
+    // A verifier exception never yields a passing verdict, whatever was evaluated before it.
+    const errored = reasons.some(x => x.code === "VERIFIER_ERROR");
     const valid =
+      !errored &&
       levels.integrity === true &&
       levels.authentic === true &&
       levels.trusted === true &&
-      levels.settlement !== false &&
-      levels.delivery !== false;
+      (levels.settlement === true || (options.offline === true && levels.settlement === null)) &&
+      (levels.delivery === true || (options.offline === true && levels.delivery === null));
     return {
       valid,
       path,
-      longTermEvidence: path === "archival" && levels.authentic === true && levels.trusted === true,
+      longTermEvidence:
+        !errored && path === "archival" && levels.authentic === true && levels.trusted === true,
+      unverifiedAlgorithms:
+        levels.integrity && Array.isArray((input as DeliveryReceipt)?.signatures)
+          ? (input as DeliveryReceipt).signatures
+              .map(s => s.alg)
+              .filter(a => !signaturesVerified.some(v => v.alg === a))
+          : [],
       signaturesVerified,
       levels,
       receiptId,
@@ -497,6 +625,20 @@ export async function verifyDeliveryReceipt(
     levels.authentic = verified.ok;
     if (verified.ok) signaturesVerified.push({ alg, kid: sigEntry.kid, engine: verified.engine });
     else reasons.push({ level: "authentic", code: "SIGNATURE_INVALID", detail: alg });
+    // Archival path: every signature the receipt carries must verify, so that a receipt valid on
+    // the archival path is valid on every path (no split verdict, §6.1).
+    const otherEntries =
+      path === "archival"
+        ? await verifyOtherSignatures(
+            r.signatures!,
+            alg,
+            chain.directory,
+            receiptId,
+            signaturesVerified,
+            reasons,
+          )
+        : { ok: true, entries: [] };
+    if (!otherEntries.ok) levels.authentic = false;
 
     // ── trusted ──
     trustBasis = chain.trustBasis;
@@ -516,6 +658,13 @@ export async function verifyDeliveryReceipt(
     for (const e of latestEntry === entry ? [entry] : [entry, latestEntry]) {
       const keyErr = keyAuthorizationError(e, alg, payload.issuedAt, now, skew);
       if (keyErr && !trustCodes.includes(keyErr)) trustCodes.push(keyErr);
+    }
+    for (const o of otherEntries.entries) {
+      const later = chain.latest!.keys.find(k => k.kid === o.entry.kid)!;
+      for (const e of later === o.entry ? [o.entry] : [o.entry, later]) {
+        const keyErr = keyAuthorizationError(e, o.alg, payload.issuedAt, now, skew);
+        if (keyErr && !trustCodes.includes(keyErr)) trustCodes.push(keyErr);
+      }
     }
     const resourceOrigin = new URL(payload.resourceUrl).origin;
     const issuerOk =
@@ -537,6 +686,9 @@ export async function verifyDeliveryReceipt(
       code: "VERIFIER_ERROR",
       detail: error instanceof Error ? error.message : String(error),
     });
+    // Levels that were being evaluated when the error happened did not pass.
+    if (levels.settlement === null) levels.settlement = false;
+    if (levels.delivery === null) levels.delivery = false;
     return done();
   }
 }
@@ -585,9 +737,26 @@ async function verifyDeliveryReceiptOrMissing(
   if (!trailer || typeof trailer !== "object") {
     return failedResult(options.path ?? "archival", "STREAM_TRAILER_MISSING");
   }
+  const t = trailer as Record<string, unknown>;
+  const carried: DeliveryReceiptSettleInfo | null =
+    t.receipt && typeof t.receipt === "object"
+      ? { receipt: t.receipt as DeliveryReceipt }
+      : t.reference && typeof t.reference === "object"
+        ? (t.reference as DeliveryReceiptSettleInfo)
+        : null;
+  if (!carried) return failedResult(options.path ?? "archival", "STREAM_TRAILER_MISSING");
   let receipt: DeliveryReceipt;
+  const resource = options.expected?.resourceUrl;
+  const issuers = [
+    ...(resource ? [new URL(resource).origin] : []),
+    ...(options.acceptedIssuers ?? []),
+  ];
   try {
-    receipt = await resolveDeliveryReceipt(trailer as DeliveryReceiptSettleInfo, fetchImpl);
+    receipt = await resolveDeliveryReceipt(
+      carried,
+      fetchImpl,
+      issuers.length ? issuers : undefined,
+    );
   } catch (error) {
     return failedResult(
       options.path ?? "archival",
@@ -622,6 +791,7 @@ function failedResult(
     valid: false,
     path,
     longTermEvidence: false,
+    unverifiedAlgorithms: [],
     signaturesVerified: [],
     levels: { integrity: false, authentic: null, trusted: null, settlement: null, delivery: null },
     receiptId: null,
@@ -743,7 +913,10 @@ export function withDeliveryReceipts(
         | Record<string, { info?: Partial<DeliveryReceiptDeclarationInfo> }>
         | undefined
     )?.[DELIVERY_RECEIPT];
-    if (declared?.info?.deliveryMode === "stream") return response;
+    // The declaration is the server's word: only an actual event stream is passed through to be
+    // verified with verifySseDelivery; anything else is verified (and fails) as a body.
+    const isEventStream = /^text\/event-stream\b/i.test(response.headers.get("content-type") ?? "");
+    if (declared?.info?.deliveryMode === "stream" && isEventStream) return response;
     const info = extractDeliveryReceipt(settle);
     if (!declared && !info) return response;
 
@@ -752,7 +925,11 @@ export function withDeliveryReceipts(
       result = failedResult(path, "RECEIPT_MISSING");
     } else {
       try {
-        const receipt = await resolveDeliveryReceipt(info, baseFetch);
+        const requestOrigin = new URL(request.url).origin;
+        const receipt = await resolveDeliveryReceipt(info, baseFetch, [
+          requestOrigin,
+          ...(options.acceptedIssuers ?? []),
+        ]);
         const issuer = receipt.payload.issuer;
         const dirUrl =
           options.keyDirectoryUrls?.[issuer] ??

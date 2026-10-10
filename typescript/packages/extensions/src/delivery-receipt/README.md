@@ -1,6 +1,6 @@
 # x402 Delivery-Receipt Extension
 
-Spec: [`specs/extensions/delivery-receipt.md`](../../../../../specs/extensions/delivery-receipt.md) (draft v0.2,
+Spec: [`specs/extensions/delivery-receipt.md`](../../../../../specs/extensions/delivery-receipt.md) (draft v0.2.1,
 test vectors in Appendix A and `delivery-receipt.vectors.json`)
 
 After a successful settle, the resource server signs a receipt that binds the settlement
@@ -18,6 +18,11 @@ The verdict says which path was taken (`path`, `longTermEvidence`). The payload 
 epoch and digest it was signed under; the directory lives at a stable URL with immutable archives at
 `<keyDirectory>/epoch/<n>`.
 
+By default `PAYMENT-RESPONSE` carries only a reference `{ receiptId, receiptUrl, digest }` (under 300
+octets; the spec's budget is 1 KB) and the receipt is served, immutable, as `JCS(receipt)` at
+`receiptUrl`; the client checks `digest` on the fetched octets before parsing them. Nothing is added
+to the response body.
+
 ## Server
 
 ```ts
@@ -29,6 +34,7 @@ import {
   generateReceiptKeyPair,
   buildKeyDirectory,
   activeKeyEntry,
+  createMemoryReceiptStore,
 } from "@x402/extensions/delivery-receipt";
 
 // Persist the seeds; keep the governance seeds offline.
@@ -50,11 +56,17 @@ const directory = await buildKeyDirectory({
   keys: keys.map(k => activeKeyEntry(k, now)),
 });
 
+// Receipts by reference (default): any store that serves the exact document, immutable, at
+// https://api.example.com/x402/receipts/<receiptId>. The memory store is for tests and examples.
+const receiptStore = createMemoryReceiptStore("https://api.example.com");
+// app.get("/x402/receipts/:id", req => receiptStore.handle(req));
+
 const server = new x402ResourceServer(facilitatorClient).registerExtension(
   createDeliveryReceiptExtension({
     issuer: "https://api.example.com",
     signers: keys.map(createLocalReceiptSigner),
     directory, // or () => currentDirectory()
+    receiptStore, // or receiptTransport: "inline" if every hop accepts an ~8 KB PAYMENT-RESPONSE
   }),
 );
 
@@ -77,8 +89,12 @@ import { createSseReceiptWriter } from "@x402/extensions/delivery-receipt";
 
 const writer = createSseReceiptWriter(config, { resourceUrl, method: "GET", requirements, settle });
 for await (const event of source) res.write(await writer.frame(JSON.stringify(event)));
-res.end((await writer.finish()).event); // terminal `x402-delivery-receipt` event with the receipt
+res.end((await writer.finish()).event); // terminal `x402-delivery-receipt` event
 ```
+
+Frames are what `EventSource` dispatches as `MessageEvent.data`. The terminal event carries
+`frameCount`, the stream digest and the receipt reference (`{ frameCount, digest, reference }`), and
+the signed payload binds the same two values. Nothing travels in HTTP trailers.
 
 ## Client
 

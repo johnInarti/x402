@@ -20,10 +20,13 @@ import {
   STREAM_TRAILER_EVENT,
   activeKeyEntry,
   buildKeyDirectory,
+  MAX_REFERENCE_EXTENSION_BYTES,
   canonicalJson,
+  computeReceiptDigest,
   computeReceiptId,
   computeStreamDigest,
   createDeliveryReceiptExtension,
+  createMemoryReceiptStore,
   createLocalReceiptSigner,
   createReceiptPayload,
   createSseReceiptWriter,
@@ -154,7 +157,14 @@ function settleContext(overrides: Partial<SettleResultContext> = {}): SettleResu
  * @returns Configuration
  */
 function config(overrides: Partial<DeliveryReceiptServerConfig> = {}): DeliveryReceiptServerConfig {
-  return { issuer: ISSUER, signers, directory, now: () => NOW, ...overrides };
+  return {
+    issuer: ISSUER,
+    signers,
+    directory,
+    now: () => NOW,
+    receiptTransport: "inline",
+    ...overrides,
+  };
 }
 
 /**
@@ -401,7 +411,11 @@ describe("delivery-receipt: directory epochs and chaining", () => {
 
   it("verifies an old receipt against archives chained to the current directory (tls)", async () => {
     const r = await issue();
-    const v = await verifyDeliveryReceipt(r, { directories: [e3, directory, e2], now: T3 + 10 });
+    const v = await verifyDeliveryReceipt(r, {
+      directories: [e3, directory, e2],
+      now: T3 + 10,
+      offline: true,
+    });
     expect(v.reasons).toEqual([]);
     expect(v).toMatchObject({
       valid: true,
@@ -419,6 +433,7 @@ describe("delivery-receipt: directory epochs and chaining", () => {
       directory,
       directoryTrust: pinnedPq(),
       now: T3 + 10,
+      offline: true,
     });
     expect(pinned.valid).toBe(true);
     expect(pinned.longTermEvidence).toBe(true);
@@ -488,6 +503,7 @@ describe("delivery-receipt: directory epochs and chaining", () => {
       directories: [directory, revoked],
       path: "session",
       now: NOW + 60,
+      offline: true,
     });
     expect(s.valid).toBe(true);
   });
@@ -532,7 +548,11 @@ describe("delivery-receipt: directory epochs and chaining", () => {
     const chain = await fetchKeyDirectoryChain(DIR_URL, 1, f);
     expect(served).toEqual([DIR_URL, `${DIR_URL}/epoch/1`, `${DIR_URL}/epoch/2`]);
     expect(chain).toHaveLength(3);
-    const v = await verifyDeliveryReceipt(await issue(), { directories: chain, now: T3 });
+    const v = await verifyDeliveryReceipt(await issue(), {
+      directories: chain,
+      now: T3,
+      offline: true,
+    });
     expect(v.valid).toBe(true);
     served.length = 0;
     expect(await fetchKeyDirectoryChain(DIR_URL, 3, f)).toHaveLength(1);
@@ -662,37 +682,28 @@ describe("delivery-receipt: server extension", () => {
     expect(bad.payload.logIndex).toBeNull();
   });
 
-  it("supports delivery by reference with id check on resolution", async () => {
-    const store = new Map<string, DeliveryReceipt>();
+  it("supports delivery by reference with digest and id checks on resolution", async () => {
+    const store = createMemoryReceiptStore(ISSUER);
     const ext = createDeliveryReceiptExtension(
-      config({
-        receiptStore: {
-          put: async (id, r) => {
-            store.set(id, r);
-            return `${ISSUER}/x402/receipts/${id}`;
-          },
-        },
-      }),
+      config({ receiptTransport: "reference", receiptStore: store }),
     );
     const out = (await ext.enrichSettlementResponse!({}, settleContext())) as {
-      info: { receiptId: string; receiptUrl: string };
+      info: { receiptId: string; receiptUrl: string; digest: string };
     };
     const info = extractDeliveryReceipt({
       ...settle,
       extensions: { [DELIVERY_RECEIPT]: out },
     } as SettleResponse)!;
-    const fakeFetch = (async (url: string) =>
-      new Response(JSON.stringify(store.get(url.split("/").pop()!)), {
-        status: 200,
-      })) as unknown as typeof fetch;
+    const fakeFetch = (async (url: string) => store.handle(url)!) as unknown as typeof fetch;
     const receipt = await resolveDeliveryReceipt(info, fakeFetch);
     expect(await computeReceiptId(receipt.payload)).toBe(out.info.receiptId);
+    expect(await computeReceiptDigest(receipt)).toBe(out.info.digest);
 
-    // A store that substitutes another genuine receipt is detected.
+    // A store that substitutes another genuine receipt is detected (by the digest first).
     const other = await issue(settleContext({ transportContext: transport(new Uint8Array([1])) }));
     const swapFetch = (async () =>
-      new Response(JSON.stringify(other), { status: 200 })) as unknown as typeof fetch;
-    await expect(resolveDeliveryReceipt(info, swapFetch)).rejects.toThrow(/does not match/);
+      new Response(canonicalJson(other), { status: 200 })) as unknown as typeof fetch;
+    await expect(resolveDeliveryReceipt(info, swapFetch)).rejects.toThrow(/digest/);
   });
 });
 
@@ -719,7 +730,12 @@ describe("delivery-receipt: verification paths", () => {
       path: "archival",
       longTermEvidence: true,
       trustBasis: "pinned",
-      signaturesVerified: [{ alg: "ml-dsa-65", kid: keyPq.kid, engine: "noble" }],
+      // The archival path checks every signature of the receipt (no split verdict).
+      signaturesVerified: [
+        { alg: "ml-dsa-65", kid: keyPq.kid, engine: "noble" },
+        { alg: "ed25519", kid: keyEd.kid, engine: "webcrypto" },
+      ],
+      unverifiedAlgorithms: [],
       levels: { integrity: true, authentic: true, trusted: true, settlement: true, delivery: true },
     });
     expect(archival.receiptId).toBe(await computeReceiptId(receipt.payload));
@@ -748,9 +764,15 @@ describe("delivery-receipt: verification paths", () => {
       false,
     );
     // In session only the Ed25519 signature is checked; the result is not long-term evidence.
-    const s = await verifyDeliveryReceipt(badPq, { directory, path: "session", now: NOW });
+    const s = await verifyDeliveryReceipt(badPq, {
+      directory,
+      path: "session",
+      now: NOW,
+      offline: true,
+    });
     expect(s.valid).toBe(true);
     expect(s.longTermEvidence).toBe(false);
+    expect(s.unverifiedAlgorithms).toEqual(["ml-dsa-65"]);
 
     const badEd = clone(receipt);
     sigOf(badEd, "ed25519").signature = flip(sigOf(badEd, "ed25519").signature);
@@ -758,7 +780,19 @@ describe("delivery-receipt: verification paths", () => {
       (await verifyDeliveryReceipt(badEd, { directory, path: "session", now: NOW })).levels
         .authentic,
     ).toBe(false);
-    expect((await verifyDeliveryReceipt(badEd, { directory, now: NOW })).valid).toBe(true);
+    // Archival checks every signature: a broken Ed25519 signature is not ignored there either,
+    // so archival-valid implies session-valid.
+    const archivalBadEd = await verifyDeliveryReceipt(badEd, {
+      directory,
+      now: NOW,
+      offline: true,
+    });
+    expect(archivalBadEd.valid).toBe(false);
+    expect(archivalBadEd.reasons).toContainEqual({
+      level: "authentic",
+      code: "SIGNATURE_INVALID",
+      detail: "ed25519",
+    });
   });
 
   it("requires the signature pair structurally on every path", async () => {
@@ -902,8 +936,14 @@ describe("delivery-receipt: verification paths", () => {
     const v = await verifyDeliveryReceipt(receipt, { directory, now: NOW });
     expect(codes(v)).toContain("ISSUER_NOT_AUTHORIZED");
     expect(
-      (await verifyDeliveryReceipt(receipt, { directory, acceptedIssuers: [ISSUER], now: NOW }))
-        .valid,
+      (
+        await verifyDeliveryReceipt(receipt, {
+          directory,
+          acceptedIssuers: [ISSUER],
+          now: NOW,
+          offline: true,
+        })
+      ).valid,
     ).toBe(true);
     const future = await verifyDeliveryReceipt(await issue(), { directory, now: NOW - 3600 });
     expect(codes(future)).toContain("ISSUED_AT_IN_FUTURE");
@@ -1166,21 +1206,17 @@ describe("delivery-receipt: stream mode (SSE)", () => {
     expect(codes(v)).toContain("STREAM_TRAILER_MISMATCH");
   });
 
-  it("supports the receipt by reference in the trailer", async () => {
-    const store = new Map<string, DeliveryReceipt>();
+  it("supports the receipt by reference in the terminal event", async () => {
+    const store = createMemoryReceiptStore(ISSUER);
     const { text, trailer } = await runStream(20, {
-      receiptStore: {
-        put: async (id, r) => {
-          store.set(id, r);
-          return `${ISSUER}/x402/receipts/${id}`;
-        },
-      },
+      receiptTransport: "reference",
+      receiptStore: store,
     });
-    expect("receiptUrl" in trailer).toBe(true);
-    const f = (async (url: string) =>
-      new Response(JSON.stringify(store.get(url.split("/").pop()!)))) as unknown as typeof fetch;
+    expect(Object.keys(trailer).sort()).toEqual(["digest", "frameCount", "reference"]);
+    const f = (async (url: string) => store.handle(url)!) as unknown as typeof fetch;
     const v = await verifySseDelivery(text, { directory, expected: expectedStream(), now: NOW }, f);
     expect(v.reasons).toEqual([]);
+    expect(v.valid).toBe(true);
   });
 
   it("refuses frames after finish and empty frames", async () => {
@@ -1258,12 +1294,14 @@ describe("delivery-receipt: fetch plugin", () => {
    * @param receipt - Receipt to attach (undefined = declared but not delivered)
    * @param body - Body to serve
    * @param dirs - Directory documents by URL
+   * @param contentType - Content-Type of the paid response
    * @returns fetch-compatible function
    */
   const network = (
     receipt: DeliveryReceipt | undefined,
     body: Uint8Array = BODY,
     dirs: Record<string, unknown> = { [DIR_URL]: directory },
+    contentType = "application/json",
   ) =>
     (async (input: RequestInfo | URL) => {
       const req = new Request(input);
@@ -1279,7 +1317,7 @@ describe("delivery-receipt: fetch plugin", () => {
       return new Response(body, {
         status: 200,
         headers: {
-          "content-type": "application/json",
+          "content-type": contentType,
           "PAYMENT-RESPONSE": encodePaymentResponseHeader(s),
         },
       });
@@ -1376,8 +1414,175 @@ describe("delivery-receipt: fetch plugin", () => {
       // Unpaid requests and streamed routes pass through untouched.
       const plain = await withDeliveryReceipts(network(receipt))(RESOURCE);
       expect(getDeliveryReceiptResult(plain)).toBeUndefined();
-      const streamed = await withDeliveryReceipts(network(undefined))(paidRequest("stream"));
+      const streamed = await withDeliveryReceipts(
+        network(undefined, BODY, undefined, "text/event-stream"),
+      )(paidRequest("stream"));
       expect(getDeliveryReceiptResult(streamed)).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("delivery-receipt: receipt by reference (default since v0.2.1, §5.5)", () => {
+  const refConfig = (o: Partial<DeliveryReceiptServerConfig> = {}) =>
+    config({ receiptTransport: undefined, receiptStore: createMemoryReceiptStore(ISSUER), ...o });
+
+  const issueRef = async (o: Partial<DeliveryReceiptServerConfig> = {}) => {
+    const store =
+      (o.receiptStore as ReturnType<typeof createMemoryReceiptStore>) ??
+      createMemoryReceiptStore(ISSUER);
+    const ext = createDeliveryReceiptExtension(refConfig({ receiptStore: store, ...o }));
+    const member = (await ext.enrichSettlementResponse!({}, settleContext())) as {
+      info: { receiptId: string; receiptUrl: string; digest: string };
+    };
+    return { member, store };
+  };
+
+  it("is the default and needs a store; inline is an explicit choice", async () => {
+    expect(() => createDeliveryReceiptExtension(config({ receiptTransport: undefined }))).toThrow(
+      /by reference by default/,
+    );
+    const ext = createDeliveryReceiptExtension(refConfig());
+    const declared = (await ext.enrichPaymentRequiredResponse!(
+      {},
+      {} as PaymentRequiredContext,
+    )) as {
+      info: { receiptTransport: string };
+    };
+    expect(declared.info.receiptTransport).toBe("reference");
+    const inline = createDeliveryReceiptExtension(config({ receiptTransport: "inline" }));
+    const d2 = (await inline.enrichPaymentRequiredResponse!({}, {} as PaymentRequiredContext)) as {
+      info: { receiptTransport: string };
+    };
+    expect(d2.info.receiptTransport).toBe("inline");
+  });
+
+  it("puts only { receiptId, receiptUrl, digest } in PAYMENT-RESPONSE, within 1 KB", async () => {
+    const { member, store } = await issueRef();
+    expect(Object.keys(member)).toEqual(["info"]); // no schema, no receipt
+    expect(Object.keys(member.info).sort()).toEqual(["digest", "receiptId", "receiptUrl"]);
+    expect(member.info.receiptUrl).toBe(`${ISSUER}/x402/receipts/${member.info.receiptId}`);
+    const bytes = new TextEncoder().encode(JSON.stringify(member)).length;
+    expect(bytes).toBeLessThanOrEqual(MAX_REFERENCE_EXTENSION_BYTES);
+    // The whole header stays small; the same receipt inline is ~8 KB of base64.
+    const header = encodePaymentResponseHeader({
+      ...settle,
+      extensions: { [DELIVERY_RECEIPT]: member },
+    });
+    expect(header.length).toBeLessThan(1024);
+    const inline = encodePaymentResponseHeader({
+      ...settle,
+      extensions: { [DELIVERY_RECEIPT]: { info: { receipt: await issue() } } },
+    });
+    expect(inline.length).toBeGreaterThan(7000);
+    // The store serves exactly JCS(receipt), immutable, and its SHA-256 is the digest.
+    const res = store.handle(member.info.receiptUrl)!;
+    expect(res.headers.get("cache-control")).toMatch(/immutable/);
+    const doc = await res.text();
+    expect(await sha256Hex(doc)).toBe(member.info.digest);
+    expect(canonicalJson(JSON.parse(doc))).toBe(doc);
+  });
+
+  it("refuses store URLs that are cross-origin, not https, not addressed by id, or over budget", async () => {
+    const bad = (url: (id: string) => string) => ({ put: (id: string) => url(id) });
+    for (const [store, re] of [
+      [bad(id => `https://cdn.example.net/x402/receipts/${id}`), /same-origin/],
+      [bad(id => `https://api.example.com/x402/receipts/${id}?v=1`), /receiptId/],
+      [bad(() => `https://api.example.com/x402/receipts/latest`), /receiptId/],
+      [bad(id => `https://api.example.com/${"p/".repeat(400)}${id}`), /budget/],
+    ] as const) {
+      await expect(issueRef({ receiptStore: store })).rejects.toThrow(re);
+    }
+  });
+
+  it("keeps stored documents immutable", () => {
+    const store = createMemoryReceiptStore(ISSUER);
+    store.put("a".repeat(64), {} as DeliveryReceipt, "{}");
+    expect(() => store.put("a".repeat(64), {} as DeliveryReceipt, '{"x":1}')).toThrow(
+      /never changes/,
+    );
+  });
+
+  it("checks the digest before parsing, then JCS, then the id", async () => {
+    const { member, store } = await issueRef();
+    const info = member.info;
+    const doc = store.get(info.receiptId)!;
+    const serve = (text: string) =>
+      (async () => new Response(text, { status: 200 })) as unknown as typeof fetch;
+    expect(await computeReceiptId((await resolveDeliveryReceipt(info, serve(doc))).payload)).toBe(
+      info.receiptId,
+    );
+    // Same receipt, other bytes (pretty-printed): the digest no longer matches.
+    const pretty = JSON.stringify(JSON.parse(doc), null, 2);
+    await expect(resolveDeliveryReceipt(info, serve(pretty))).rejects.toThrow(/digest/);
+    // Even with a digest computed over those bytes, a non-canonical document is refused.
+    await expect(
+      resolveDeliveryReceipt({ ...info, digest: await sha256Hex(pretty) }, serve(pretty)),
+    ).rejects.toThrow(/JCS/);
+    // A signature swapped by the store changes the digest although receiptId still matches.
+    const swapped = JSON.parse(doc) as DeliveryReceipt;
+    swapped.signatures.reverse();
+    await expect(resolveDeliveryReceipt(info, serve(canonicalJson(swapped)))).rejects.toThrow(
+      /digest/,
+    );
+    // Malformed references fail before any fetch.
+    const seen: string[] = [];
+    const spy = (async (u: string) => {
+      seen.push(u);
+      return new Response(doc);
+    }) as unknown as typeof fetch;
+    await expect(resolveDeliveryReceipt({ ...info, digest: "" }, spy)).rejects.toThrow(/digest/);
+    await expect(
+      resolveDeliveryReceipt({ ...info, receiptUrl: `${ISSUER}/x402/receipts/latest` }, spy),
+    ).rejects.toThrow(/addressed/);
+    expect(seen).toEqual([]);
+  });
+
+  it("verifies end to end through the fetch plugin, and fails closed without a digest", async () => {
+    const store = createMemoryReceiptStore(ISSUER);
+    const { member } = await issueRef({ receiptStore: store });
+    const net = (m: unknown) =>
+      (async (input: RequestInfo | URL) => {
+        const req = new Request(input);
+        if (req.url === DIR_URL) return new Response(JSON.stringify(directory));
+        const served = store.handle(req);
+        if (served) return served;
+        return new Response(BODY, {
+          headers: {
+            "content-type": "application/json",
+            "PAYMENT-RESPONSE": encodePaymentResponseHeader({
+              ...settle,
+              extensions: { [DELIVERY_RECEIPT]: m },
+            } as SettleResponse),
+          },
+        });
+      }) as typeof fetch;
+    const paid = () =>
+      new Request(RESOURCE, {
+        headers: {
+          "PAYMENT-SIGNATURE": encodePaymentSignatureHeader({
+            x402Version: 2,
+            accepted: requirements,
+            payload: {},
+            resource: { url: RESOURCE },
+            extensions: { [DELIVERY_RECEIPT]: { info: { keyDirectory: DIR_URL } } },
+          } as unknown as PaymentPayload),
+        },
+      });
+    vi.useFakeTimers({ now: NOW * 1000 });
+    try {
+      const res = await withDeliveryReceipts(net(member), {
+        pinnedGovernanceKeys: [govEd.publicKeyB64],
+      })(paid());
+      expect(new Uint8Array(await res.arrayBuffer())).toEqual(BODY); // body untouched
+      expect(getDeliveryReceiptResult(res)).toMatchObject({ valid: true, path: "session" });
+      const noDigest = {
+        info: { receiptId: member.info.receiptId, receiptUrl: member.info.receiptUrl },
+      };
+      const r2 = await withDeliveryReceipts(net(noDigest))(paid());
+      expect(getDeliveryReceiptResult(r2)!.valid).toBe(false);
+      expect(getDeliveryReceiptResult(r2)!.reasons[0].code).toBe("RECEIPT_UNAVAILABLE");
     } finally {
       vi.useRealTimers();
     }

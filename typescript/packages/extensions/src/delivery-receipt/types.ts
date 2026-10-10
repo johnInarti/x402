@@ -1,7 +1,7 @@
 /**
  * Types for the x402 delivery-receipt extension.
  *
- * Spec: specs/extensions/delivery-receipt.md (draft v0.2)
+ * Spec: specs/extensions/delivery-receipt.md (draft v0.2.1)
  */
 
 /** Extension identifier (key under `extensions`). */
@@ -16,8 +16,14 @@ export const KEY_DIRECTORY_SPEC = "x402-receipt-key-directory/1";
 /** Domain string that seeds the running digest of a stream (§5.6). */
 export const STREAM_DOMAIN = "x402-delivery-stream/1";
 
-/** SSE event type of the terminal frame that carries the stream trailer and receipt (§5.6). */
+/** SSE event type of the terminal event that carries `frameCount`, the digest and the receipt (§5.6). */
 export const STREAM_TRAILER_EVENT = "x402-delivery-receipt";
+
+/**
+ * Header budget of a receipt delivered by reference (§5.5): the UTF-8 JSON text of
+ * `SettleResponse.extensions["delivery-receipt"]` MUST NOT exceed this many octets.
+ */
+export const MAX_REFERENCE_EXTENSION_BYTES = 1024;
 
 /** Required `use` of a receipt-signing key in the directory (§7.2). */
 export const RECEIPT_KEY_USE = "x402-delivery-receipt";
@@ -50,7 +56,7 @@ export interface DeliveryReceiptDeclarationInfo {
   algorithms: ReceiptAlgorithm[];
   /** What the receipt commits to (§5.4, §5.6). Default `body`. */
   deliveryMode?: "body" | "stream";
-  /** Where the receipt travels (§5.5). Default `inline`. */
+  /** Where the receipt travels (§5.5). Default `reference`. */
   receiptTransport?: "inline" | "reference";
 }
 
@@ -114,15 +120,27 @@ export interface DeliveryReceipt {
   signatures: ReceiptSignature[];
 }
 
-/** Settle-response `info` (§5.1 / §5.5). */
-export type DeliveryReceiptSettleInfo =
-  | { receipt: DeliveryReceipt }
-  | { receiptId: string; receiptUrl: string };
+/**
+ * Compact reference to a receipt served at `receiptUrl` (§5.5), the default transport.
+ * `digest` is the lowercase hex SHA-256 of the octets served there, which are exactly
+ * `JCS(receipt)`; the client checks it before parsing or trusting the document.
+ */
+export interface DeliveryReceiptReference {
+  receiptId: string;
+  receiptUrl: string;
+  digest: string;
+}
 
-/** Data of the terminal SSE frame of a stream (§5.6). */
+/** Settle-response `info` (§5.1 / §5.5): a reference (default) or the receipt inline. */
+export type DeliveryReceiptSettleInfo = DeliveryReceiptReference | { receipt: DeliveryReceipt };
+
+/**
+ * Data of the terminal `x402-delivery-receipt` event of a stream (§5.6). `digest` here is the
+ * stream digest; a receipt delivered by reference is nested under `reference`.
+ */
 export type StreamTrailer = { frameCount: number; digest: string } & (
   | { receipt: DeliveryReceipt }
-  | { receiptId: string; receiptUrl: string }
+  | { reference: DeliveryReceiptReference }
 );
 
 export type KeyStatus = "reserved" | "active" | "retiring" | "retired" | "revoked";
@@ -185,7 +203,10 @@ export interface ReceiptVerificationLevels {
 }
 
 export interface ReceiptVerificationResult {
-  /** True only when every level that was evaluated passed. */
+  /**
+   * True only when all five levels passed (§8.1 "valid for the client"); with `offline: true`,
+   * `settlement` may be unevaluated. Never true after a verifier error.
+   */
   valid: boolean;
   /** Which signature path was verified (§8.1). */
   path: VerificationPath;
@@ -196,6 +217,12 @@ export interface ReceiptVerificationResult {
   longTermEvidence: boolean;
   /** Algorithms whose signatures were verified, with the engine used. */
   signaturesVerified: { alg: ReceiptAlgorithm; kid: string; engine: string }[];
+  /**
+   * Algorithms present in `signatures` whose signature was NOT checked (on the session path, at
+   * least `ml-dsa-65`). A client that keeps the receipt as evidence must still run the archival
+   * path before relying on it (§6.1).
+   */
+  unverifiedAlgorithms: ReceiptAlgorithm[];
   levels: ReceiptVerificationLevels;
   receiptId: string | null;
   /** How the directory's governance key was trusted. */

@@ -134,7 +134,11 @@ export function parseSse(text: string): SseEvent[] {
   let event = "";
   let id: string | undefined;
   const body = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
-  for (const line of body.split(/\r\n|\r|\n/)) {
+  const lines = body.split(/\r\n|\r|\n/);
+  // The last element is an unterminated line (or ""): EventSource never processes it, and an event
+  // still pending at end of stream is discarded, not dispatched.
+  lines.pop();
+  for (const line of lines) {
     if (line === "") {
       if (data.length) events.push({ event: event || "message", data: data.join("\n"), id });
       data = [];

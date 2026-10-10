@@ -16,6 +16,8 @@ export {
   toBase64,
   fromCanonicalBase64,
   computeReceiptId,
+  computeReceiptDigest,
+  receiptDocument,
   receiptSignedMessage,
 } from "./encoding";
 export {
@@ -54,6 +56,9 @@ export {
   buildReceiptPayload,
   createReceiptPayload,
   createSseReceiptWriter,
+  createMemoryReceiptStore,
+  type ReceiptStore,
+  type MemoryReceiptStore,
   type DirectorySource,
   type ReceiptFacts,
   type SseReceiptContext,

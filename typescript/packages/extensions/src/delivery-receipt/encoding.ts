@@ -4,7 +4,7 @@
  */
 
 import { base64 } from "@scure/base";
-import { RECEIPT_DOMAIN, type DeliveryReceiptPayload } from "./types";
+import { RECEIPT_DOMAIN, type DeliveryReceipt, type DeliveryReceiptPayload } from "./types";
 
 const MAX_DEPTH = 16;
 
@@ -24,6 +24,11 @@ export function canonicalJson(value: unknown, depth = 0): string {
     case "boolean":
       return value ? "true" : "false";
     case "string":
+      // I-JSON (RFC 7493 §2.1): strings MUST be valid Unicode. A lone surrogate has no UTF-8
+      // encoding, so runtimes disagree on it (escaped vs. replaced vs. rejected) (§3).
+      if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(value)) {
+        throw new Error("canonicalJson: lone surrogate in signed string");
+      }
       return JSON.stringify(value);
     case "number":
       if (!Number.isSafeInteger(value) || Object.is(value, -0)) {
@@ -37,6 +42,7 @@ export function canonicalJson(value: unknown, depth = 0): string {
       const obj = value as Record<string, unknown>;
       // RFC 8785 sorts by UTF-16 code units, which is what Array.prototype.sort does by default.
       const keys = Object.keys(obj).sort();
+      for (const k of keys) canonicalJson(k, depth + 1); // keys obey the same string rule
       return `{${keys
         .map(k => {
           if (obj[k] === undefined) throw new Error(`canonicalJson: undefined value at "${k}"`);
@@ -111,6 +117,27 @@ export async function computeReceiptId(payload: DeliveryReceiptPayload): Promise
 }
 
 /**
+ * The document served at `receiptUrl` (§5.5): the JCS text of the whole wire object
+ * (payload and signatures). It is the only representation a server may serve there.
+ *
+ * @param receipt - The wire receipt
+ * @returns Canonical JSON text
+ */
+export function receiptDocument(receipt: DeliveryReceipt): string {
+  return canonicalJson(receipt);
+}
+
+/**
+ * The `digest` of a receipt reference (§5.5): lowercase hex SHA-256 of {@link receiptDocument}.
+ *
+ * @param receipt - The wire receipt
+ * @returns The reference digest
+ */
+export async function computeReceiptDigest(receipt: DeliveryReceipt): Promise<string> {
+  return sha256Hex(receiptDocument(receipt));
+}
+
+/**
  * Exact bytes signed for a receipt (§5.3).
  *
  * @param receiptId - Receipt id from {@link computeReceiptId}
@@ -118,4 +145,42 @@ export async function computeReceiptId(payload: DeliveryReceiptPayload): Promise
  */
 export function receiptSignedMessage(receiptId: string): Uint8Array {
   return new TextEncoder().encode(`${RECEIPT_DOMAIN}\n${receiptId}`);
+}
+
+/**
+ * Strict JSON parse for receipts and directories received as text (§12): refuses a BOM, oversized
+ * input and duplicate member names (JSON.parse silently keeps the last one, other parsers keep the
+ * first, so a duplicate makes two verifiers read two different payloads).
+ *
+ * @param text - JSON text
+ * @param maxBytes - Maximum UTF-16 length accepted
+ * @returns Parsed value
+ */
+export function parseJsonStrict(text: string, maxBytes = 1024 * 1024): unknown {
+  if (typeof text !== "string") throw new Error("expected JSON text");
+  if (text.length > maxBytes) throw new Error("JSON too large");
+  if (text.charCodeAt(0) === 0xfeff) throw new Error("JSON starts with a BOM");
+  const value = JSON.parse(text);
+  const stack: (Set<string> | null)[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      const raw = text.slice(i, j + 1);
+      let k = j + 1;
+      while (k < text.length && /\s/.test(text[k])) k++;
+      const scope = stack[stack.length - 1];
+      if (text[k] === ":" && scope) {
+        const key = JSON.parse(raw) as string;
+        if (scope.has(key))
+          throw new Error(`duplicate JSON member ${JSON.stringify(key.slice(0, 64))}`);
+        scope.add(key);
+      }
+      i = j;
+    } else if (c === "{") stack.push(new Set());
+    else if (c === "[") stack.push(null);
+    else if (c === "}" || c === "]") stack.pop();
+  }
+  return value;
 }

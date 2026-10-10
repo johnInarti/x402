@@ -157,7 +157,10 @@ export async function verifySignatureWithEngine(
         signature as BufferSource,
         message as BufferSource,
       );
-      return { ok, engine: "webcrypto" };
+      // WebCrypto Ed25519 is not uniformly strict across runtimes (Node 20 accepts a
+      // small-order public key with R = identity, S = 0). Require the strict RFC 8032
+      // check as well, so the verdict never depends on the engine (§6.1).
+      return { ok: ok && verifySignature(alg, publicKey, message, signature), engine: "webcrypto" };
     } catch {
       return { ok: false, engine: "webcrypto" };
     }

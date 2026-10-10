@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft (v0.2) |
+| Status | Draft (v0.2.1) |
 | Extension key | `delivery-receipt` |
 | x402 versions | v2 (the signed payload itself is version-agnostic) |
 | Transports | HTTP (normative). MCP / A2A: see §11 |
@@ -29,6 +29,10 @@ inside the x402 session with the WebCrypto API available on edge runtimes, and a
 signature for the archival path, so the receipt stays usable as long-lived evidence without depending on a
 signature scheme that a cryptographically relevant quantum computer would break. A verifier states which path it
 took.
+
+On HTTP the `PAYMENT-RESPONSE` header carries, by default, only a compact reference to the receipt
+(`receiptId`, `receiptUrl`, `digest`; at most 1 KB), and the receipt itself is served immutable at a URL addressed by
+its id (§5.5). Nothing is added to the response body.
 
 Signing keys are published in a **signed key directory** at a stable URL, with an immutable archive per epoch and a
 hash chain between epochs. With the archive of the epoch a receipt names, a receipt can be verified **offline**, by
@@ -71,12 +75,34 @@ The two extensions MAY be declared together. Both then place an artifact in `Set
    `(network, transaction, logIndex)` taken from the `delivery-receipt` payload (§12). An `offer-receipt` receipt
    that arrives in the same `SettleResponse` MUST NOT be counted as a second payment.
 
+### 2.2 Relationship to the `x402-served` profile (legacy)
+
+Some issuers already sign `x402-served` receipts (a profile of the FractalAI Trust Kernel), whose signed message is
+`"FRACTALAI-x402-served-v1" || "\n" || route_id || "\n" || digest` — a route label and a content digest, with no
+settlement fields. The following rules are normative for x402 routes:
+
+1. **`delivery-receipt` subsumes `x402-served`.** It binds everything `x402-served` binds — the content digest
+   (`delivery`) and the route (`resourceUrl`, `method`) — plus the settlement (`network`, `transaction`, `logIndex`,
+   `payer`, `amount`, `asset`, `payTo`, `scheme`) and the key-directory epoch and digest. `x402-served` remains a
+   legacy profile for receipts already issued; new x402 integrations SHOULD issue `delivery-receipt` only.
+2. **One authoritative receipt.** A seller that emits both for one paid response MUST derive them from the same
+   response, and a verifier MUST treat `delivery-receipt` as authoritative for that response: where the two disagree,
+   the `delivery-receipt` verdict stands, and an `x402-served` receipt never makes a failing `delivery-receipt` pass.
+   For accounting the pair is one payment (§12).
+3. **Route identity.** In `x402-served`, `route_id` is a label chosen by the seller: it separates the seller's
+   domains, not endpoints, and a third party cannot recompute it (a seller can reuse one label across endpoints).
+   `delivery-receipt` binds `resourceUrl` and `method` of the request as the client made it, which the client — and
+   any third party holding the request line — can recompute and compare (§8.3).
+
 ## 3. Terminology
 
 - **Receipt payload** (`payload`): the JSON object of §5.2.
 - **JCS**: JSON Canonicalization Scheme, RFC 8785. Signed JSON in this extension MUST contain only strings,
   booleans, `null`, arrays, objects and integers in the IEEE-754 safe range (|n| ≤ 2^53 − 1). Floating-point
-  numbers are not allowed anywhere in a signed object.
+  numbers are not allowed anywhere in a signed object, and neither is `-0` (JCS prints it as `0`, other encoders as
+  `-0`). Strings, including member names, MUST be valid Unicode (I-JSON, RFC 7493 §2.1): a lone surrogate has no
+  UTF-8 encoding and runtimes disagree on how to hash it. A verifier MUST reject a payload or directory that violates
+  this subset (`integrity`) instead of coercing it.
 - **Receipt id** (`receiptId`): the **64-character lowercase hexadecimal text** of `SHA-256(JCS(payload))`. It is
   text, not the 32 raw digest bytes.
 - **Signed message**: the exact octets passed to every signature algorithm (§5.3):
@@ -102,7 +128,7 @@ A server that will issue delivery receipts for a route declares it in the 402 re
         "keyDirectory": "https://api.example.com/.well-known/x402-receipt-keys",
         "algorithms": ["ed25519", "ml-dsa-65"],
         "deliveryMode": "body",
-        "receiptTransport": "inline"
+        "receiptTransport": "reference"
       },
       "schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -133,7 +159,7 @@ A server that will issue delivery receipts for a route declares it in the 402 re
 | `keyDirectory` | string | Yes | **Stable** HTTPS URL of the current key directory (§7.1). |
 | `algorithms` | string[] | Yes | Algorithms of the signatures every receipt will carry (§6). MUST include `ed25519` and `ml-dsa-65`. |
 | `deliveryMode` | string | No | `body` (default, §5.4) or `stream` (§5.6). |
-| `receiptTransport` | string | No | `inline` (default) or `reference` (§5.5). |
+| `receiptTransport` | string | No | `reference` (default) or `inline` (§5.5). A client MUST accept both forms wherever a receipt travels. |
 
 The declaration is a **promise, not a proof**: a client MUST NOT treat the presence of the declaration as evidence
 that a receipt will be returned, and the absence of a receipt after a successful settle does not invalidate the
@@ -143,17 +169,23 @@ settlement (§8.4).
 
 ### 5.1 Placement
 
-For `deliveryMode: "body"`, on a successful settle the server adds the receipt to the `SettleResponse` it returns to
-the client (on HTTP, the `PAYMENT-RESPONSE` header), under the v2 extension structure:
+For `deliveryMode: "body"`, on a successful settle the server adds to the `SettleResponse` it returns to the client
+(on HTTP, the `PAYMENT-RESPONSE` header), under the v2 extension structure, either a **reference** (the default,
+§5.5) or the receipt **inline**:
 
 ```
-SettleResponse.extensions["delivery-receipt"].info.receipt
+SettleResponse.extensions["delivery-receipt"].info = { "receiptId", "receiptUrl", "digest" }   ; reference (default)
+SettleResponse.extensions["delivery-receipt"].info = { "receipt": { "payload", "signatures" } } ; inline
 ```
 
-For `deliveryMode: "stream"` the receipt travels in the terminal frame of the stream (§5.6), because the response
-headers are sent before the content exists.
+The settle-response member is `{ "info": … }`; the JSON Schema of §10 is not repeated on the wire.
 
-A receipt MUST NOT be returned for a failed settle (`success: false`).
+For `deliveryMode: "stream"` the receipt (or its reference) travels in the terminal event of the stream (§5.6),
+because the response headers are sent before the content exists.
+
+A server MUST NOT place the receipt, or its reference, in the response body: the body stays byte-identical to what
+`delivery.sha256` (or the stream digest) covers. A receipt MUST NOT be returned for a failed settle
+(`success: false`).
 
 ### 5.2 Receipt payload (version 1)
 
@@ -233,19 +265,54 @@ the response body that the server hands to the transport for this request, **bef
 A server MUST NOT issue a body-mode receipt when it cannot observe the whole body — for example when the payment flow
 settles before the handler runs. Streamed routes use §5.6.
 
-### 5.5 Delivery by reference
+### 5.5 Delivery by reference (default) and header budget
 
-An inline receipt with both baseline signatures makes the `PAYMENT-RESPONSE` header about 8 KB (base64). Servers whose
-infrastructure limits header size MAY declare `"receiptTransport": "reference"` and return instead:
+An inline receipt with both baseline signatures makes the `PAYMENT-RESPONSE` header about 8 KB (base64), and the same
+response may already carry a `PAYMENT-REQUIRED`-sized challenge on the way in; a client or proxy with a 16 KB total
+header limit is one extension away from failing. Receipts are therefore delivered **by reference by default**:
 
 ```json
-{ "info": { "receiptId": "<hex>", "receiptUrl": "https://api.example.com/x402/receipts/<hex>" } }
+{
+  "info": {
+    "receiptId": "<64 hex>",
+    "receiptUrl": "https://api.example.com/x402/receipts/<64 hex>",
+    "digest": "<64 hex>"
+  }
+}
 ```
 
-`receiptUrl` MUST be same-origin with `issuer` and MUST return the wire object of §5.3 as `application/json` without
-payment. The client MUST recompute the receipt id from the fetched payload and reject it if it differs from
-`receiptId` (this prevents a store from substituting another genuine receipt). Servers SHOULD keep referenced
-receipts retrievable for at least 30 days.
+| Field | Description |
+|---|---|
+| `receiptId` | The receipt id (§3) of the referenced receipt. |
+| `receiptUrl` | `https` URL, same-origin with `issuer`, whose last path segment is `receiptId` (no query, no fragment). |
+| `digest` | `lowercase_hex(SHA-256(D))`, where `D` is the UTF-8 encoding of `JCS(receipt)` — the whole wire object of §5.3, payload and `signatures`. |
+
+**Header budget.** By reference, the UTF-8 JSON text of `SettleResponse.extensions["delivery-receipt"]` MUST NOT
+exceed **1024 octets** (the reference above is under 300). This is the size assumption of this extension; a server MUST
+check it before responding. A server MAY deliver the receipt inline (`"receiptTransport": "inline"`) only when it knows
+that every hop between it and the client accepts the resulting response headers; this extension makes no assumption
+about that size.
+
+**Serving.** `GET receiptUrl` MUST return, without payment, `application/json` whose body is exactly the octets `D`.
+The resource is **immutable**: it MUST return the same octets for as long as it is served (servers SHOULD send
+`Cache-Control: public, max-age=31536000, immutable`), and servers SHOULD keep it retrievable for at least 30 days.
+Because the URL is addressed by `receiptId` and the octets are fixed by `digest`, any static store or CDN can serve
+it.
+
+**Resolving.** The URL comes from the server's response, so the client MUST decide whether to fetch it **before**
+fetching: `receiptId` and `digest` are 64 lowercase hex characters; `receiptUrl` is `https`, same-origin with an issuer
+the client accepts for the resource (§8.2) and ends with `/<receiptId>`. The fetch MUST NOT follow redirects and SHOULD
+be bounded in size (e.g. 256 KiB). Then, in this order, the client MUST:
+
+1. check that `SHA-256` of the octets received equals `digest`, **before parsing or trusting them**;
+2. parse them with a parser that rejects duplicate member names, and check that they are the JCS text of the parsed
+   object;
+3. recompute the receipt id from the payload and reject it if it differs from `receiptId` (this prevents a store from
+   substituting another genuine receipt), and check that `payload.issuer` is the origin of `receiptUrl`;
+4. verify the receipt as any other (§8).
+
+Any failure is a missing receipt (§8.4), never a receipt of lower standing. A client MUST accept a receipt inline even
+when the declaration said `reference`, and a reference even when it said `inline`.
 
 ### 5.6 Stream mode
 
@@ -267,9 +334,16 @@ alone. A stream with no frames has `frameCount: 0` and `digest = hex(d_0)`.
 
 - A frame is each event that an `EventSource` would dispatch (HTML Living Standard, "Server-sent events"), in order,
   **excluding** the terminal event. The frame octets are the UTF-8 encoding of the event's data buffer, i.e. the
-  value `MessageEvent.data` exposes (multiple `data:` lines joined with a line feed, no trailing line feed). Comment
-  lines, `retry:` fields and events with an empty data buffer are not frames. The `event` and `id` fields are not
-  hashed; servers SHOULD put everything the buyer pays for in `data`.
+  value `MessageEvent.data` exposes: the values of the event's `data:` lines joined with a line feed, no trailing
+  line feed. Field names, the `event:`, `id:` and `retry:` lines and the blank line that ends the event are not part
+  of the frame, so the raw octets of the stream are never hashed and a buyer can recompute the digest from a browser.
+  Comment lines, `retry:` fields and events with an empty data buffer are not frames. The `event` and `id` fields are
+  not hashed; servers SHOULD put everything the buyer pays for in `data`.
+- Because an `EventSource` treats CR, LF and CRLF alike as line ends, a server MUST hash each frame **as the client
+  will see it**: with every CRLF and every lone CR replaced by LF. A server MUST NOT emit a content event whose
+  `event` field contains CR or LF or equals `x402-delivery-receipt`.
+- As in `EventSource`, an event that is still pending when the stream ends (not terminated by a blank line) is
+  discarded: it is not a frame, and a terminal event without its blank line is missing.
 - The stream ends with one **terminal event** of type `x402-delivery-receipt` whose data is a single-line JSON object:
 
   ```
@@ -277,9 +351,20 @@ alone. A stream with no frames has `frameCount: 0` and `digest = hex(d_0)`.
   data: {"frameCount":901,"digest":"<hex>","receipt":{"payload":{…},"signatures":[…]}}
   ```
 
-  or, when the receipt is delivered by reference, `{"frameCount", "digest", "receiptId", "receiptUrl"}` (§5.5).
+  or, when the receipt is delivered by reference (§5.5),
+  `{"frameCount":901,"digest":"<hex>","reference":{"receiptId","receiptUrl","digest"}}` — the reference is nested,
+  because `digest` at the top level is the stream digest. The `reference` form is the default; since the terminal
+  event is not a header, the 1 KB budget does not constrain the `receipt` form here.
 - `frameCount` and `digest` in the terminal event MUST equal `payload.delivery.frameCount` and
   `payload.delivery.digest`.
+- The terminal values travel **only** in the terminal event and in the signed payload. They MUST NOT be carried
+  (only) in HTTP trailer fields, which many proxies and client libraries drop.
+- A browser client can recompute the digest from `EventSource` alone: the frames are the `MessageEvent.data` values
+  in order. `EventSource` dispatches a named event only to listeners for that name, so such a client MUST listen to
+  every event type the route emits (servers SHOULD document them; e.g. `hello`, `pool`, `expired`) or read the
+  response with `fetch()` and an event-stream parser. An event it did not observe makes the digest disagree: the
+  receipt then fails, it never passes falsely. On the terminal event the client SHOULD call `close()`: a reconnection
+  is a new request, not covered by this receipt.
 
 The server settles the payment before streaming (there is no body to buffer), sends the frames, and signs the
 receipt when the stream ends, over the settlement it obtained. `responseContentType` is normally
@@ -288,8 +373,13 @@ comparing them with the terminal event and with the signed payload; altering, re
 frame changes the digest or the count, and a stream that ends without the terminal event has no receipt. Events
 after the terminal event are not covered and a client MUST treat their presence as a delivery failure.
 
-Other framings (for example newline-delimited JSON, or HTTP trailers on chunked responses) can be registered by
-amending this section; each MUST define what a frame is and where the terminal frame travels.
+Other framings (for example newline-delimited JSON) can be registered by amending this section; each MUST define what
+a frame is and where the terminal frame travels, in the content itself. A verifier MUST reject
+(`integrity`) a stream receipt whose `framing` is not registered, since the digest has no defined meaning otherwise.
+
+The `deliveryMode` of the declaration is the server's word, not the client's observation: a client MUST NOT skip
+receipt verification because the 402 declared `stream`. A response that is not an event stream is verified as a
+body (and, without a receipt, fails).
 
 ## 6. Algorithms
 
@@ -316,6 +406,15 @@ this table, an `alg` that differs from the directory entry of its `kid`, and len
   presented as long-term evidence.
 - Both signatures cover the same message, so stripping one of them does not change what the other attests; a receipt
   that lacks either baseline signature is malformed (`integrity` fails) on every path.
+- **No split verdict.** A present-but-invalid signature is not "absent": an archival verifier MUST verify **every**
+  entry of `signatures` (each under the key of its `kid`, with the lifecycle of §7.4) and reject the receipt if any
+  fails, so a receipt valid on the archival path is valid on every path. A session verifier MUST report the
+  algorithms it did not check. Because a server can pair a valid `ed25519` signature with a broken `ml-dsa-65` one,
+  a client that will keep a receipt as evidence MUST run the archival path before relying on it, and SHOULD do so
+  before the session ends when its runtime allows it (e.g. Node.js, browsers with a WASM ML-DSA).
+- Ed25519 public keys in a directory MUST be canonical encodings of points that are not of small order, and
+  verifiers MUST use RFC 8032 strict verification (no ZIP-215 leniency); a small-order key would accept a forged
+  signature for any message.
 
 New algorithms are added by amending this table. A hybrid composite is expressed as a further entry of
 `signatures`, not as a second receipt.
@@ -396,7 +495,10 @@ MUST report that basis:
   verification. Pinning one governance key does not vouch for a signature made by another one: a verifier that pins
   only the `ml-dsa-65` governance key and checks the `ed25519` signature has not established `pinned` trust. A
   verifier that pins SHOULD also remember the highest `(epoch, root)` it has accepted and reject a lower epoch
-  (rollback) or a different root for the same epoch (equivocation).
+  (rollback) or a different root for the same epoch (equivocation). Remembering is only useful if it is enforced:
+  a verifier that has accepted epoch `m` MUST reject a receipt whose chain, as supplied, ends below `m` — even when
+  every document is signed by a pinned key — because the missing epochs may revoke the signing key (§7.5 step 5).
+  A pinned verifier that is online SHOULD fetch the current directory from the stable URL and chain to it.
 - `tls` — the key is accepted because the current directory was fetched over HTTPS from the issuer's stable URL.
   This is trust-on-first-use and MUST be reported as such.
 
@@ -436,7 +538,10 @@ To evaluate a receipt, a verifier:
      failure. Fetching epochs `n … current − 1` from the archive path is sufficient. Verifiers SHOULD bound the
      number of epochs they fetch (e.g. 64).
    - With `pinned` trust, epoch `n` alone is sufficient (it is signed by a pinned key); later epochs, when available,
-     MUST still chain.
+     MUST still chain, and a remembered higher epoch MUST be reached (§7.3). A result obtained without the current
+     directory MUST report the latest epoch it was chained to, since revocation status is only known up to it.
+   - A verifier that bounds the number of epochs MUST fail when the bound is exceeded; it MUST NOT silently drop
+     documents (the dropped tail is the current epoch, which carries the latest revocations).
 5. Evaluates the key lifecycle (§7.4) for the signing key both in epoch `n` and in the latest chained epoch, so a
    revocation published after issuance is honored.
 
@@ -455,8 +560,12 @@ separately:
 | `settlement` | The payload matches the settlement the client observed (§8.3), and any `offer-receipt` receipt in the same `SettleResponse` agrees with it (§2.1). |
 | `delivery` | The body digest (body mode), or the frame count, running digest and terminal event (stream mode), equal what the client received, and `responseStatus`, when not `null`, equals the observed status. |
 
-A verifier MUST report which path it used. A receipt is **valid for the client** only if all five levels pass. A
-result is **long-term evidence** only if it was obtained on the archival path with `authentic` and `trusted` passing.
+A verifier MUST report which path it used. A receipt is **valid for the client** only if all five levels pass; a
+level that was not evaluated has not passed, and an implementation that exposes a single "valid" verdict MUST NOT
+return it as true when `settlement` or `delivery` was not evaluated, unless the caller explicitly asked for a
+third-party (offline) evaluation. A verifier error (exception, unexpected input type) MUST yield a failing verdict,
+never a partially evaluated passing one. A result is **long-term evidence** only if it was obtained on the archival
+path with `authentic` and `trusted` passing.
 An offline third party that has the receipt, the directory epoch(s) and the content can evaluate `integrity`,
 `authentic`, `trusted` and `delivery`; `settlement` can then be checked against the chain (`transaction`, `logIndex`,
 `payTo`, `amount`, `asset`).
@@ -480,6 +589,9 @@ Inside the x402 session the client MUST check:
 - `payload.paymentId` equals the `payment-identifier` id the client sent, if any;
 - when the `SettleResponse` also carries an `offer-receipt` receipt, the rule of §2.1.
 
+The `SettleResponse` is server-supplied data: a field of an unexpected type (e.g. a non-string `payer`) is a
+mismatch, not a reason to skip the comparison.
+
 ### 8.4 Failure handling
 
 Receipts are issued after settlement, so a failed or missing receipt cannot undo a payment. A client that required
@@ -489,8 +601,8 @@ automatically.
 
 ## 9. Example (x402 v2, HTTP, body mode)
 
-`PAYMENT-RESPONSE` (decoded; the complete value with real keys and signatures is the `endToEnd` member of
-[`delivery-receipt.vectors.json`](./delivery-receipt.vectors.json)):
+`PAYMENT-RESPONSE` (decoded) with the default transport — a reference of 283 octets for the
+`delivery-receipt` member:
 
 ```json
 {
@@ -501,40 +613,50 @@ automatically.
   "extensions": {
     "delivery-receipt": {
       "info": {
-        "receipt": {
-          "payload": {
-            "version": 1,
-            "issuer": "https://api.example.com",
-            "resourceUrl": "https://api.example.com/premium-data",
-            "method": "GET",
-            "scheme": "exact",
-            "network": "eip155:8453",
-            "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-            "payTo": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
-            "amount": "10000",
-            "payer": "0x857b06519E91e3A54538791bDbb0E22373e36b66",
-            "transaction": "0x5c6e0000000000000000000000000000000000000000000000000000000000a1",
-            "logIndex": 312,
-            "paymentId": null,
-            "responseStatus": null,
-            "responseContentType": "application/json",
-            "delivery": {
-              "mode": "body",
-              "sha256": "<hex SHA-256 of the body>"
-            },
-            "keyDirectoryEpoch": 1,
-            "keyDirectoryDigest": "<root of epoch 1>",
-            "issuedAt": 1790473960
-          },
-          "signatures": [
-            { "alg": "ed25519", "kid": "<kid>", "signature": "<base64, 64 bytes>" },
-            { "alg": "ml-dsa-65", "kid": "<kid>", "signature": "<base64, 3309 bytes>" }
-          ]
-        }
-      },
-      "schema": { "$ref": "§10" }
+        "receiptId": "80223224b44405c123eeb2269aa85d98110fabeee0668fca038d1c360657863b",
+        "receiptUrl": "https://api.example.com/x402/receipts/80223224b44405c123eeb2269aa85d98110fabeee0668fca038d1c360657863b",
+        "digest": "833ac85c9562151925552435cb7db05683fcf4a69147952de8967138858cc9a2"
+      }
     }
   }
+}
+```
+
+`GET receiptUrl` returns the wire object as JCS text (shown indented here; the octets served, whose SHA-256 is
+`digest`, are the `reference.document` member of the `endToEnd` vector in
+[`delivery-receipt.vectors.json`](./delivery-receipt.vectors.json), with real keys and signatures). The same object is
+what an inline `info.receipt` carries:
+
+```json
+{
+  "payload": {
+    "version": 1,
+    "issuer": "https://api.example.com",
+    "resourceUrl": "https://api.example.com/premium-data",
+    "method": "GET",
+    "scheme": "exact",
+    "network": "eip155:8453",
+    "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "payTo": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+    "amount": "10000",
+    "payer": "0x857b06519E91e3A54538791bDbb0E22373e36b66",
+    "transaction": "0x5c6e0000000000000000000000000000000000000000000000000000000000a1",
+    "logIndex": 312,
+    "paymentId": null,
+    "responseStatus": null,
+    "responseContentType": "application/json",
+    "delivery": {
+      "mode": "body",
+      "sha256": "<hex SHA-256 of the body>"
+    },
+    "keyDirectoryEpoch": 1,
+    "keyDirectoryDigest": "<root of epoch 1>",
+    "issuedAt": 1790473960
+  },
+  "signatures": [
+    { "alg": "ed25519", "kid": "<kid>", "signature": "<base64, 64 bytes>" },
+    { "alg": "ml-dsa-65", "kid": "<kid>", "signature": "<base64, 3309 bytes>" }
+  ]
 }
 ```
 
@@ -567,11 +689,15 @@ automatically.
       "required": ["payload", "signatures"]
     },
     "receiptId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-    "receiptUrl": { "type": "string", "format": "uri" }
+    "receiptUrl": { "type": "string", "format": "uri" },
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
   },
-  "oneOf": [{ "required": ["receipt"] }, { "required": ["receiptId", "receiptUrl"] }]
+  "oneOf": [{ "required": ["receipt"] }, { "required": ["receiptId", "receiptUrl", "digest"] }]
 }
 ```
+
+The schema documents the `info` object; it is not repeated in the settle response (§5.1), so that a reference stays
+within the header budget of §5.5.
 
 ## 11. Other transports
 
@@ -601,7 +727,14 @@ framing registered for that transport. Implementations MUST document what they h
   otherwise a single point of failure. Anchoring directory roots in a public log or on-chain is compatible with this
   format and out of scope of this version.
 - **Canonicalization.** Only the subset of §3 is signed, so every conforming JCS implementation produces identical
-  bytes. Verifiers SHOULD parse the receipt with a parser that rejects duplicate keys.
+  bytes. Verifiers MUST parse receipts and directories received as text with a parser that rejects duplicate member
+  names (JSON.parse keeps the last one, other parsers the first, so a duplicate lets two verifiers — or a verifier and
+  a display — read two different payloads).
+- **Receipts by reference.** `receiptUrl` is an unauthenticated capability URL: anyone who learns it can read the
+  receipt (and with it the payer–transaction–content link below). `receiptId` is a SHA-256 over a payload that
+  contains the transaction, so it is not guessable, but clients and servers SHOULD treat the URL as confidential as
+  the receipt itself. The `digest` binds the signatures as well as the payload, so a store or cache cannot swap a
+  signature without detection; serving the octets `D` exactly is what makes `digest` checkable before parsing.
 - **Streams.** The SSE framing hashes event data only; `event` and `id` fields are not covered. A stream receipt is
   signed at the end of the stream, after settlement: a server can stop a stream early and sign the shorter stream,
   and the receipt then states what was delivered, not what was promised.
@@ -635,13 +768,16 @@ framing registered for that transport. Implementations MUST document what they h
 | Version | Date | Changes | Author |
 |---|---|---|---|
 | 0.1 | 2026-10-09 | Initial draft. | FractalAI (FRACTAL AI S.A.S.) |
+| 0.2.1 | 2026-10-10 | Decisions from public review (x402-foundation/x402#3758): receipts delivered **by reference by default** — `PAYMENT-RESPONSE` carries `{ receiptId, receiptUrl, digest }` within a stated 1 KB budget, the receipt is served immutable as JCS at a URL addressed by `receiptId`, `digest` checked before parsing, nothing in the body (§5.1, §5.5, §10); relationship to the legacy `x402-served` profile (§2.2); stream terminal values only in the terminal `x402-delivery-receipt` event (never an HTTP trailer), nested `reference`, browser `EventSource` rules, and a 15-minute SSE session fixture (§5.6, Appendix B). From a separate adversarial (red-team) review: no split verdict between paths (archival checks every signature); pinned verifiers enforce a remembered epoch; `valid` means five levels and never follows a verifier error; reference URLs checked before fetching; SSE CR normalisation, event-name and end-of-stream rules; registered framings only; `-0` and lone surrogates outside the signed subset; duplicate members MUST be rejected; epoch bounds fail instead of truncating; Ed25519 strict verification stated (§6.1). | FractalAI (FRACTAL AI S.A.S.) |
 | 0.2 | 2026-10-09 | From public review (x402-foundation/x402#3758): signed octets stated unambiguously with test vectors (Appendix A); `signatures[]` with an `ed25519` (session) + `ml-dsa-65` (archival) pair, directory signed by the same pair; `keyDirectoryEpoch`/`keyDirectoryDigest` in the payload, stable directory URL with per-epoch archives and chaining; stream mode; corrected `offer-receipt` framing and composition rule (§2, §2.1). The wire object of v0.1 (`alg`/`kid`/`signature`) is replaced; payload and domain identifiers stay at version 1 while the extension is a draft. | FractalAI (FRACTAL AI S.A.S.) |
 
 ## Appendix A. Test vectors
 
 These vectors were generated by the TypeScript reference implementation (`@x402/extensions/delivery-receipt`) and
-are checked by its test suite and by an independent JavaScript implementation, both of which read them from this
-appendix. All values are exact. Keys are derived from the 32-octet `seed` (Ed25519: the seed is the RFC 8032 private
+are checked by its test suite and by a second implementation (a JavaScript port of the reference,
+`@fractalai/x402-receipts`) that reproduces them byte for byte; both read them from this appendix. The port shares the
+reference's structure, so agreement between the two shows that the vectors are reproducible from the text, not that
+two independent designs agree. All values are exact. Keys are derived from the 32-octet `seed` (Ed25519: the seed is the RFC 8032 private
 key; ML-DSA: the seed is FIPS 204 `ξ`). Signatures were produced with deterministic signing; verify them rather than
 re-signing if your ML-DSA signer is hedged.
 
@@ -756,8 +892,17 @@ The same payload is used for every algorithm. `jcs` is the exact UTF-8 text of `
 
 ## Appendix B. End-to-end vector
 
-[`delivery-receipt.vectors.json`](./delivery-receipt.vectors.json) contains, besides the vectors above, an `endToEnd`
-member with a complete key directory (epoch 1, governance pair, receipt-key pair), the receipt the reference
-implementation issues for the example of §9 (both signatures), the body, the settlement and the requirements, and a
-complete SSE event stream with its terminal frame. With the governance keys pinned, it must verify on both paths at
-`now`, with every level passing.
+[`delivery-receipt.vectors.json`](./delivery-receipt.vectors.json) contains, besides the vectors above:
+
+- `endToEnd`: a complete key directory (epoch 1, governance pair, receipt-key pair), the receipt the reference
+  implementation issues for the example of §9 (both signatures), the body, the settlement and the requirements, and a
+  complete SSE event stream with its terminal event (receipt inline). With the governance keys pinned, it must verify
+  on both paths at `now`, with every level passing.
+- `endToEnd.reference`: the same receipt delivered by reference (§5.5) — the settle-response member, its size in
+  octets (within the 1 KB budget) and the exact `document` served at `receiptUrl`, whose SHA-256 is `digest`.
+- `streamSession`: a paid SSE route modelled on a real one — one response held open for a 15-minute window, events
+  `hello`, `pool` and `expired`, keep-alive comments, `retry:` and `id:` fields, one two-line event and one event
+  written with CRLF — with the receipt by reference in the terminal `x402-delivery-receipt` event. It gives the event
+  stream, the events an `EventSource` dispatches, the frames, `frameCount`, `digest`, the terminal event, the receipt
+  document, and the `recipe` (frames, event names, ids and raw lines in order) from which a writer reproduces the
+  stream byte for byte. The data is synthetic; keys and directory are those of `endToEnd`.

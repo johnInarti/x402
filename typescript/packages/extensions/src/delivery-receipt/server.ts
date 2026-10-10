@@ -3,9 +3,10 @@
  *
  * Uses the extension hooks to (1) declare the extension in 402 responses and (2) sign a
  * receipt after a successful settle, binding the settlement to the SHA-256 of the response
- * body that the HTTP middleware buffered for settlement. Streamed routes use
- * {@link createSseReceiptWriter}, which hashes frames as they are sent and emits the receipt in a
- * terminal frame (§5.6).
+ * body that the HTTP middleware buffered for settlement. By default `PAYMENT-RESPONSE` carries only
+ * a compact reference `{ receiptId, receiptUrl, digest }` and the receipt is served, immutable, at
+ * `receiptUrl` (§5.5). Streamed routes use {@link createSseReceiptWriter}, which hashes frames as
+ * they are sent and ends the stream with a terminal `x402-delivery-receipt` event (§5.6).
  *
  * Spec: specs/extensions/delivery-receipt.md
  */
@@ -18,17 +19,27 @@ import type {
   SettleResultContext,
 } from "@x402/core/types";
 import type { HTTPTransportContext } from "@x402/core/http";
-import { computeReceiptId, receiptSignedMessage, sha256Hex, toBase64 } from "./encoding";
+import {
+  computeReceiptId,
+  receiptDocument,
+  receiptSignedMessage,
+  sha256Hex,
+  toBase64,
+} from "./encoding";
 import { StreamDigest, formatSseEvent, formatSseTrailer } from "./stream";
 import {
   ARCHIVAL_ALGORITHM,
   DELIVERY_RECEIPT,
   KEY_DIRECTORY_WELL_KNOWN_PATH,
+  MAX_REFERENCE_EXTENSION_BYTES,
   SESSION_ALGORITHM,
+  STREAM_TRAILER_EVENT,
   type DeliveryCommitment,
   type DeliveryReceipt,
   type DeliveryReceiptDeclarationInfo,
   type DeliveryReceiptPayload,
+  type DeliveryReceiptReference,
+  type DeliveryReceiptSettleInfo,
   type KeyDirectory,
   type ReceiptSigner,
   type StreamTrailer,
@@ -81,9 +92,69 @@ export const SETTLE_INFO_SCHEMA = {
     },
     receiptId: { type: "string", pattern: "^[0-9a-f]{64}$" },
     receiptUrl: { type: "string", format: "uri" },
+    digest: { type: "string", pattern: "^[0-9a-f]{64}$" },
   },
-  oneOf: [{ required: ["receipt"] }, { required: ["receiptId", "receiptUrl"] }],
+  oneOf: [{ required: ["receipt"] }, { required: ["receiptId", "receiptUrl", "digest"] }],
 } as const;
+
+/**
+ * Persists receipts delivered by reference and serves them at their `receiptUrl` (§5.5).
+ * `put` receives the exact document to serve (`JCS(receipt)`) and returns its URL, which MUST be
+ * https, same-origin with the issuer and end with `/<receiptId>`. The document at that URL MUST
+ * never change.
+ */
+export interface ReceiptStore {
+  put(receiptId: string, receipt: DeliveryReceipt, document: string): Promise<string> | string;
+}
+
+/** A {@link ReceiptStore} kept in memory, with a handler that serves it (for tests and examples). */
+export interface MemoryReceiptStore extends ReceiptStore {
+  /** The stored document for an id, if any. */
+  get(receiptId: string): string | undefined;
+  /** Serves `GET <prefix><receiptId>`; returns undefined for any other request. */
+  handle(request: Request | string): Response | undefined;
+}
+
+/**
+ * Creates an in-memory receipt store serving `${issuer}${prefix}<receiptId>`. Production
+ * deployments persist the documents (they are immutable and content-addressed, so any blob store or
+ * CDN works) and keep them retrievable for at least 30 days.
+ *
+ * @param issuer - Issuer origin
+ * @param prefix - Path prefix, default `/x402/receipts/`
+ * @returns The store
+ */
+export function createMemoryReceiptStore(
+  issuer: string,
+  prefix = "/x402/receipts/",
+): MemoryReceiptStore {
+  const origin = new URL(issuer).origin;
+  const docs = new Map<string, string>();
+  return {
+    put(receiptId, _receipt, document) {
+      const prior = docs.get(receiptId);
+      if (prior !== undefined && prior !== document) {
+        throw new Error("delivery-receipt: a stored receipt document never changes");
+      }
+      docs.set(receiptId, document);
+      return `${origin}${prefix}${receiptId}`;
+    },
+    get: receiptId => docs.get(receiptId),
+    handle(request) {
+      const u = new URL(typeof request === "string" ? request : request.url);
+      if (u.origin !== origin || !u.pathname.startsWith(prefix)) return undefined;
+      const doc = docs.get(u.pathname.slice(prefix.length));
+      if (doc === undefined) return new Response("not found", { status: 404 });
+      return new Response(doc, {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "cache-control": "public, max-age=31536000, immutable",
+        },
+      });
+    },
+  };
+}
 
 /** Settlement facts handed to an optional log-index resolver. */
 export interface SettlementLocator {
@@ -112,10 +183,13 @@ export interface DeliveryReceiptServerConfig {
    */
   resolveLogIndex?: (locator: SettlementLocator) => Promise<number | null>;
   /**
-   * When set, receipts are delivered by reference (§5.5): the store persists the receipt and
-   * returns its same-origin URL.
+   * Where the receipt travels (§5.5). Default `reference`: `PAYMENT-RESPONSE` (or the terminal
+   * stream event) carries only `{ receiptId, receiptUrl, digest }` and `receiptStore` serves the
+   * receipt. Use `inline` only when you know every hop accepts a `PAYMENT-RESPONSE` of about 8 KB.
    */
-  receiptStore?: { put(receiptId: string, receipt: DeliveryReceipt): Promise<string> };
+  receiptTransport?: "reference" | "inline";
+  /** Persists and serves receipts delivered by reference. Required for `reference`. */
+  receiptStore?: ReceiptStore;
   /** Routes declared with this extension are streamed (§5.6). Default `body`. */
   deliveryMode?: "body" | "stream";
   /** Clock override (unix seconds), for tests. */
@@ -161,8 +235,68 @@ export function buildDeclarationInfo(
     keyDirectory,
     algorithms: config.signers.map(s => s.alg),
     deliveryMode: config.deliveryMode ?? "body",
-    receiptTransport: config.receiptStore ? "reference" : "inline",
+    receiptTransport: receiptTransportOf(config),
   };
+}
+
+/**
+ * Resolves the transport of a configuration (§5.5): `reference` unless `inline` is chosen.
+ *
+ * @param config - Server configuration
+ * @returns The transport
+ */
+function receiptTransportOf(config: DeliveryReceiptServerConfig): "reference" | "inline" {
+  const transport = config.receiptTransport ?? "reference";
+  if (transport !== "reference" && transport !== "inline") {
+    throw new Error("delivery-receipt: receiptTransport must be reference or inline");
+  }
+  if (transport === "reference" && !config.receiptStore) {
+    throw new Error(
+      'delivery-receipt: receipts are delivered by reference by default; configure a receiptStore, or set receiptTransport: "inline" only if your response headers fit an ~8 KB PAYMENT-RESPONSE',
+    );
+  }
+  return transport;
+}
+
+/**
+ * Checks a receipt URL returned by a store (§5.5): https, same-origin with the issuer, and
+ * content-addressed (last path segment = receipt id).
+ *
+ * @param receiptUrl - URL returned by the store
+ * @param issuer - Issuer origin
+ * @param receiptId - Receipt id
+ */
+function assertReceiptUrl(receiptUrl: string, issuer: string, receiptId: string): void {
+  const u = new URL(receiptUrl);
+  if (u.origin !== issuer) {
+    throw new Error("delivery-receipt: receiptUrl must be same-origin with issuer");
+  }
+  if (u.protocol !== "https:" && !(u.hostname === "localhost" || u.hostname === "127.0.0.1")) {
+    throw new Error("delivery-receipt: receiptUrl must be https");
+  }
+  if (u.search || u.hash || u.pathname.split("/").pop() !== receiptId) {
+    throw new Error("delivery-receipt: receiptUrl must end with /<receiptId>");
+  }
+}
+
+/**
+ * The settle-response member for a receipt (§5.1, §5.5). The schema of §10 is not repeated on
+ * the wire, so a reference stays within the header budget.
+ *
+ * @param info - Inline receipt or reference
+ * @returns `{ info }`, checked against the budget when it is a reference
+ */
+function settleMember(info: DeliveryReceiptSettleInfo): { info: DeliveryReceiptSettleInfo } {
+  const member = { info };
+  if (!("receipt" in info)) {
+    const bytes = new TextEncoder().encode(JSON.stringify(member)).length;
+    if (bytes > MAX_REFERENCE_EXTENSION_BYTES) {
+      throw new Error(
+        `delivery-receipt: reference is ${bytes} octets, over the ${MAX_REFERENCE_EXTENSION_BYTES}-octet budget`,
+      );
+    }
+  }
+  return member;
 }
 
 /**
@@ -311,7 +445,7 @@ export async function signDeliveryReceipt(
 
 /**
  * Shared issuance path: resolves the log index, checks the signers against the directory, signs,
- * and stores the receipt when delivering by reference.
+ * and, by default, stores the receipt and returns its reference (§5.5).
  *
  * @param config - Server configuration
  * @param issuer - Issuer origin
@@ -324,7 +458,7 @@ async function issue(
   issuer: string,
   payload: DeliveryReceiptPayload,
   directory: KeyDirectory,
-): Promise<{ receipt: DeliveryReceipt } | { receiptId: string; receiptUrl: string }> {
+): Promise<{ receipt: DeliveryReceipt; reference: DeliveryReceiptReference | null }> {
   for (const s of config.signers) {
     const entry = directory.keys.find(k => k.kid === s.kid);
     if (!entry || entry.alg !== s.alg) {
@@ -346,14 +480,11 @@ async function issue(
     }
   }
   const { receipt, receiptId } = await signDeliveryReceipt(payload, config.signers);
-  if (config.receiptStore) {
-    const receiptUrl = await config.receiptStore.put(receiptId, receipt);
-    if (new URL(receiptUrl).origin !== issuer) {
-      throw new Error("delivery-receipt: receiptUrl must be same-origin with issuer");
-    }
-    return { receiptId, receiptUrl };
-  }
-  return { receipt };
+  if (receiptTransportOf(config) === "inline") return { receipt, reference: null };
+  const document = receiptDocument(receipt);
+  const receiptUrl = await config.receiptStore!.put(receiptId, receipt, document);
+  assertReceiptUrl(receiptUrl, issuer, receiptId);
+  return { receipt, reference: { receiptId, receiptUrl, digest: await sha256Hex(document) } };
 }
 
 /**
@@ -382,14 +513,13 @@ export function createDeliveryReceiptExtension(
       _: unknown,
       context: SettleResultContext,
     ): Promise<unknown> => {
-      if (info.deliveryMode === "stream") return undefined; // receipt goes in the trailer
+      if (info.deliveryMode === "stream") return undefined; // receipt goes in the terminal event
       const directory = await currentDirectory(config.directory);
       const payload = await buildReceiptPayload(context, info.issuer, now(), directory);
       if (!payload) return undefined;
-      return {
-        info: await issue(config, info.issuer, payload, directory),
-        schema: SETTLE_INFO_SCHEMA,
-      };
+      const { receipt, reference } = await issue(config, info.issuer, payload, directory);
+      // Never in the response body: the body stays byte-identical to what delivery.sha256 covers.
+      return settleMember(reference ?? { receipt });
     },
   };
 }
@@ -425,7 +555,8 @@ export interface SseReceiptWriter {
 /**
  * Creates an SSE writer for a paid stream. Frames are the UTF-8 octets of each event's `data`
  * (what `EventSource` exposes as `MessageEvent.data`); the terminal `x402-delivery-receipt` event
- * carries `frameCount`, the final digest and the receipt, whose payload binds the same two values.
+ * carries `frameCount`, the final digest and the receipt (by reference unless `inline`), whose
+ * payload binds the same two values. Nothing travels in HTTP trailers.
  *
  * @param config - Server configuration (same as the extension)
  * @param context - Settlement context of this request
@@ -443,7 +574,11 @@ export function createSseReceiptWriter(
     async frame(data: string, event?: string): Promise<string> {
       if (finished) throw new Error("delivery-receipt: stream already finished");
       if (data === "") throw new Error("delivery-receipt: empty frames are not dispatched by SSE");
-      await digest.update(data);
+      if (event !== undefined && (/[\r\n]/.test(event) || event === STREAM_TRAILER_EVENT)) {
+        throw new Error("delivery-receipt: invalid SSE event name for a content frame");
+      }
+      // Hash what EventSource will expose as MessageEvent.data: CR and CRLF become LF (§5.6).
+      await digest.update(data.replace(/\r\n|\r/g, "\n"));
       return formatSseEvent(data, event);
     },
     async finish() {
@@ -466,9 +601,11 @@ export function createSseReceiptWriter(
         issuedAt: now(),
       });
       if (!payload) throw new Error("delivery-receipt: settlement did not succeed");
-      const out = await issue(config, info.issuer, payload, directory);
-      const receiptId = "receipt" in out ? await computeReceiptId(payload) : out.receiptId;
-      const trailer = { frameCount, digest: final, ...out } as StreamTrailer;
+      const { receipt, reference } = await issue(config, info.issuer, payload, directory);
+      const receiptId = reference?.receiptId ?? (await computeReceiptId(receipt.payload));
+      const trailer: StreamTrailer = reference
+        ? { frameCount, digest: final, reference }
+        : { frameCount, digest: final, receipt };
       return { event: formatSseTrailer(trailer), trailer, receiptId };
     },
   };

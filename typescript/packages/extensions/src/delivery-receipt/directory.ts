@@ -9,7 +9,13 @@ import {
   verifySignatureWithEngine,
   type ReceiptKeyPair,
 } from "./algorithms";
-import { canonicalJson, fromCanonicalBase64, sha256Hex, toBase64 } from "./encoding";
+import {
+  canonicalJson,
+  fromCanonicalBase64,
+  parseJsonStrict,
+  sha256Hex,
+  toBase64,
+} from "./encoding";
 import {
   ARCHIVAL_ALGORITHM,
   KEY_DIRECTORY_SPEC,
@@ -398,7 +404,9 @@ export async function verifyKeyDirectoryChain(
   });
   const byEpoch = new Map<number, KeyDirectory>();
   let trustBasis: "pinned" | "tls" = "tls";
-  for (const doc of documents.slice(0, MAX_CHAIN_EPOCHS + 1)) {
+  // Never truncate silently: dropping the tail would drop the current epoch (and its revocations).
+  if (documents.length > MAX_CHAIN_EPOCHS + 1) return fail("DIRECTORY_CHAIN_TOO_LONG");
+  for (const doc of documents) {
     const r = await verifyKeyDirectory(doc, { ...options, previous: undefined });
     if (!r.ok || !r.directory) return fail(r.code ?? "DIRECTORY_INVALID", r.detail);
     const existing = byEpoch.get(r.directory.epoch);
@@ -422,8 +430,12 @@ export async function verifyKeyDirectoryChain(
   }
   if (options.previous) {
     if (latest.epoch < options.previous.epoch) {
-      // A saved copy that predates the remembered state is fine offline only if pinned.
-      if (trustBasis !== "pinned") return fail("DIRECTORY_ROLLBACK");
+      // The verifier knows a newer epoch exists. Accepting a chain that stops before it would
+      // ignore every revocation published since, even under pinned trust (§7.3, §7.5 step 5).
+      return fail(
+        "DIRECTORY_ROLLBACK",
+        `chain ends at ${latest.epoch}, ${options.previous.epoch} already accepted`,
+      );
     } else if (
       byEpoch.has(options.previous.epoch) &&
       byEpoch.get(options.previous.epoch)!.root !== options.previous.root
@@ -500,7 +512,7 @@ export async function fetchKeyDirectory(
   if (!res.ok) throw new Error(`key directory fetch failed: HTTP ${res.status}`);
   const buf = new Uint8Array(await res.arrayBuffer());
   if (buf.length > maxBytes) throw new Error("key directory too large");
-  return JSON.parse(new TextDecoder().decode(buf));
+  return parseJsonStrict(new TextDecoder("utf-8", { fatal: true }).decode(buf), maxBytes);
 }
 
 /**

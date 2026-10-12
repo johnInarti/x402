@@ -775,7 +775,7 @@ framing registered for that transport. Implementations MUST document what they h
 | Version | Date | Changes | Author |
 |---|---|---|---|
 | 0.1 | 2026-10-09 | Initial draft. | FractalAI (FRACTAL AI S.A.S.) |
-| 0.2.1 | 2026-10-10 | Decisions from public review (x402-foundation/x402#3758): receipts delivered **by reference by default** — `PAYMENT-RESPONSE` carries `{ receiptId, receiptUrl, digest }` within a stated 1 KB budget, the receipt is served immutable as JCS at a URL addressed by `receiptId`, `digest` checked before parsing, nothing in the body (§5.1, §5.5, §10); relationship to the legacy `x402-served` profile (§2.2); stream terminal values only in the terminal `x402-delivery-receipt` event (never an HTTP trailer), nested `reference`, browser `EventSource` rules, and a 15-minute SSE session fixture (§5.6, Appendix B). From a separate adversarial (red-team) review: no split verdict between paths (archival checks every signature); pinned verifiers enforce a remembered epoch; `valid` means five levels and never follows a verifier error; reference URLs checked before fetching; SSE CR normalisation, event-name and end-of-stream rules; registered framings only; `-0` and lone surrogates outside the signed subset; duplicate members MUST be rejected; epoch bounds fail instead of truncating; Ed25519 strict verification stated (§6.1). | FractalAI (FRACTAL AI S.A.S.) Post-review addenda: §8.2 relationship to `payee-name` (delivery is not payee identity); Appendix A table of which runtime verified each row, plus an OpenSSL-only check. |
+| 0.2.1 | 2026-10-10 | Decisions from public review (x402-foundation/x402#3758): receipts delivered **by reference by default** — `PAYMENT-RESPONSE` carries `{ receiptId, receiptUrl, digest }` within a stated 1 KB budget, the receipt is served immutable as JCS at a URL addressed by `receiptId`, `digest` checked before parsing, nothing in the body (§5.1, §5.5, §10); relationship to the legacy `x402-served` profile (§2.2); stream terminal values only in the terminal `x402-delivery-receipt` event (never an HTTP trailer), nested `reference`, browser `EventSource` rules, and a 15-minute SSE session fixture (§5.6, Appendix B). From a separate adversarial (red-team) review: no split verdict between paths (archival checks every signature); pinned verifiers enforce a remembered epoch; `valid` means five levels and never follows a verifier error; reference URLs checked before fetching; SSE CR normalisation, event-name and end-of-stream rules; registered framings only; `-0` and lone surrogates outside the signed subset; duplicate members MUST be rejected; epoch bounds fail instead of truncating; Ed25519 strict verification stated (§6.1). | FractalAI (FRACTAL AI S.A.S.) Post-review addenda: §8.2 relationship to `payee-name` (delivery is not payee identity); Appendix A table of which runtime verified each row, plus an OpenSSL-only check. Appendix A.6: worked directory-root example and the digests of common wrong projections (public review). |
 | 0.2 | 2026-10-09 | From public review (x402-foundation/x402#3758): signed octets stated unambiguously with test vectors (Appendix A); `signatures[]` with an `ed25519` (session) + `ml-dsa-65` (archival) pair, directory signed by the same pair; `keyDirectoryEpoch`/`keyDirectoryDigest` in the payload, stable directory URL with per-epoch archives and chaining; stream mode; corrected `offer-receipt` framing and composition rule (§2, §2.1). The wire object of v0.1 (`alg`/`kid`/`signature`) is replaced; payload and domain identifiers stay at version 1 while the extension is a draft. | FractalAI (FRACTAL AI S.A.S.) |
 
 ## Appendix A. Test vectors
@@ -910,6 +910,34 @@ The same payload is used for every algorithm. `jcs` is the exact UTF-8 text of `
 ```
 
 <!-- VECTORS:END -->
+
+### A.6 Key directory root (§7.2), worked example
+
+The directory of Appendix B (`endToEnd.directory`) has nine members. The root covers **exactly seven** of them:
+`root` and `signatures` are outside the preimage, `governanceKeys` is sorted by `alg` and `keys` by `kid`
+(here `ed25519, ml-dsa-65` and `153053ad13ee065b, c47ca781ddf6ace8`).
+
+```
+preimage = JCS({spec, issuer, epoch, prevRoot, publishedAt, governanceKeys, keys})   → 5905 UTF-8 octets
+root     = lowercase_hex(SHA-256(preimage))
+         = 40b0560cd3637678eef1ff13743dfbac97ed6f153dcabebc536e3bc5e1e9e4a6
+```
+
+A verifier that gets another value has almost always hashed a different projection. These are the common ones,
+with the digest each produces for this vector, so a mismatch can be diagnosed instead of read as a broken directory
+(the pattern was found in public review, x402-foundation/x402#3758):
+
+| Projection hashed (wrong) | SHA-256 |
+|---|---|
+| document without `signatures`, but **`root` still inside** | `d2b584052f3b4eba60f9623067c6fa899441121ad867985693462750bd231bc1` |
+| whole document, `root` and `signatures` included | `b781c6532561bae7fe3c855a33203c4c9b882cca53bde9b3fbb6aa2903aeb0c6` |
+| seven members, arrays **not sorted** (here: reversed) | `d7b1a34dc2bc97c4f931023713137c381974d522bad7f5053de67f6ec7d9f412` |
+| six members, `publishedAt` omitted | `0c5c80bc9a971aeb6b619e9e33e53c176b3bffd56a6b904864a117e5b9a54d89` |
+| seven members serialised with insertion order instead of JCS | `23d5a755a17f2b9e1eda158a8c5de73168a11530a16106d0713579157278fbd1` |
+
+Sorting matters only when an issuer serves the arrays in another order; a directory that already serves them sorted
+gives the same root with or without the sort, so test with the reversed row above. This appendix is informative: the
+normative construction is the `root` row of §7.2.
 
 ## Appendix B. End-to-end vector
 

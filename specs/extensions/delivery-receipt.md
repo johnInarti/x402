@@ -295,7 +295,10 @@ about that size.
 
 **Serving.** `GET receiptUrl` MUST return, without payment, `application/json` whose body is exactly the octets `D`.
 The resource is **immutable**: it MUST return the same octets for as long as it is served (servers SHOULD send
-`Cache-Control: public, max-age=31536000, immutable`), and servers SHOULD keep it retrievable for at least 30 days.
+`Cache-Control: private, no-store` by default; an issuer MAY opt in to public archival with
+`Cache-Control: public, max-age=31536000, immutable` and SHOULD state that choice in its documentation), and servers
+SHOULD keep it retrievable for at least 30 days. Immutability rests on `receiptId` addressing and `digest`, not on
+public cacheability.
 Because the URL is addressed by `receiptId` and the octets are fixed by `digest`, any static store or CDN can serve
 it.
 
@@ -742,6 +745,8 @@ framing registered for that transport. Implementations MUST document what they h
   contains the transaction, so it is not guessable, but clients and servers SHOULD treat the URL as confidential as
   the receipt itself. The `digest` binds the signatures as well as the payload, so a store or cache cannot swap a
   signature without detection; serving the octets `D` exactly is what makes `digest` checkable before parsing.
+  Origin deletion is not cache deletion: a receipt served with a public cache policy may outlive the origin's
+  retention, and an issuer MUST NOT describe origin deletion as revocation of the capability.
 - **Streams.** The SSE framing hashes event data only; `event` and `id` fields are not covered. A stream receipt is
   signed at the end of the stream, after settlement: a server can stop a stream early and sign the shorter stream,
   and the receipt then states what was delivered, not what was promised.

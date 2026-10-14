@@ -558,5 +558,363 @@
       }
     },
     "receiptDocument": "{\"payload\":{\"amount\":\"10000\",\"asset\":\"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\",\"delivery\":{\"digest\":\"0db2f423c8f867249e9ea358b0b92e6c3eadb017af0029a30f243d9fb3b4c9f9\",\"frameCount\":18,\"framing\":\"sse\",\"mode\":\"stream\"},\"issuedAt\":1790473960,\"issuer\":\"https://api.example.com\",\"keyDirectoryDigest\":\"40b0560cd3637678eef1ff13743dfbac97ed6f153dcabebc536e3bc5e1e9e4a6\",\"keyDirectoryEpoch\":1,\"logIndex\":312,\"method\":\"GET\",\"network\":\"eip155:8453\",\"payTo\":\"0x209693Bc6afc0C5328bA36FaF03C514EF312287C\",\"payer\":\"0x857b06519E91e3A54538791bDbb0E22373e36b66\",\"paymentId\":null,\"resourceUrl\":\"https://api.example.com/v2/sentinel/stream\",\"responseContentType\":\"text/event-stream\",\"responseStatus\":200,\"scheme\":\"exact\",\"transaction\":\"0x5c6e0000000000000000000000000000000000000000000000000000000000b2\",\"version\":1},\"signatures\":[{\"alg\":\"ed25519\",\"kid\":\"153053ad13ee065b\",\"signature\":\"sEr8w8g7pPxr4gfKRfIOVR0TOeio5VtnRc/hGbWMdzpctAvpR5H1MaT4gR9OsrA5f1TQCFVCriT9bJTNOeq3Dw==\"},{\"alg\":\"ml-dsa-65\",\"kid\":\"c47ca781ddf6ace8\",\"signature\":\"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\"}]}"
-  }
+  },
+  "expectedVerdicts": [
+    {
+      "id": "endToEnd/body/session",
+      "vector": "/endToEnd",
+      "path": "session",
+      "offline": false,
+      "inputs": {
+        "receipt": {
+          "$ref": "/endToEnd/receipt"
+        },
+        "directory": {
+          "$ref": "/endToEnd/directory"
+        },
+        "pinnedGovernanceKeys": {
+          "$ref": "/endToEnd/governanceKeys"
+        },
+        "now": {
+          "$ref": "/endToEnd/now"
+        },
+        "settle": {
+          "$ref": "/endToEnd/settle"
+        },
+        "requirements": {
+          "$ref": "/endToEnd/requirements"
+        },
+        "resourceUrl": {
+          "$ref": "/endToEnd/resourceUrl"
+        },
+        "method": "GET",
+        "responseBody": {
+          "$ref": "/endToEnd/body"
+        }
+      },
+      "levels": {
+        "integrity": "pass",
+        "authentic": "pass",
+        "trusted": "pass",
+        "settlement": "pass",
+        "delivery": "pass"
+      },
+      "valid": true,
+      "longTermEvidence": false,
+      "reason": null
+    },
+    {
+      "id": "endToEnd/body/archival",
+      "vector": "/endToEnd",
+      "path": "archival",
+      "offline": false,
+      "inputs": {
+        "receipt": {
+          "$ref": "/endToEnd/receipt"
+        },
+        "directory": {
+          "$ref": "/endToEnd/directory"
+        },
+        "pinnedGovernanceKeys": {
+          "$ref": "/endToEnd/governanceKeys"
+        },
+        "now": {
+          "$ref": "/endToEnd/now"
+        },
+        "settle": {
+          "$ref": "/endToEnd/settle"
+        },
+        "requirements": {
+          "$ref": "/endToEnd/requirements"
+        },
+        "resourceUrl": {
+          "$ref": "/endToEnd/resourceUrl"
+        },
+        "method": "GET",
+        "responseBody": {
+          "$ref": "/endToEnd/body"
+        }
+      },
+      "levels": {
+        "integrity": "pass",
+        "authentic": "pass",
+        "trusted": "pass",
+        "settlement": "pass",
+        "delivery": "pass"
+      },
+      "valid": true,
+      "longTermEvidence": true,
+      "reason": null
+    },
+    {
+      "id": "endToEnd/reference/session",
+      "vector": "/endToEnd/reference",
+      "path": "session",
+      "offline": false,
+      "inputs": {
+        "reference": {
+          "$ref": "/endToEnd/reference/settleExtension/info"
+        },
+        "receiptDocument": {
+          "$ref": "/endToEnd/reference/document"
+        },
+        "directory": {
+          "$ref": "/endToEnd/directory"
+        },
+        "pinnedGovernanceKeys": {
+          "$ref": "/endToEnd/governanceKeys"
+        },
+        "now": {
+          "$ref": "/endToEnd/now"
+        },
+        "settle": {
+          "$ref": "/endToEnd/settle"
+        },
+        "requirements": {
+          "$ref": "/endToEnd/requirements"
+        },
+        "resourceUrl": {
+          "$ref": "/endToEnd/resourceUrl"
+        },
+        "method": "GET",
+        "responseBody": {
+          "$ref": "/endToEnd/body"
+        }
+      },
+      "levels": {
+        "integrity": "pass",
+        "authentic": "pass",
+        "trusted": "pass",
+        "settlement": "pass",
+        "delivery": "pass"
+      },
+      "valid": true,
+      "longTermEvidence": false,
+      "reason": null
+    },
+    {
+      "id": "endToEnd/reference/archival",
+      "vector": "/endToEnd/reference",
+      "path": "archival",
+      "offline": false,
+      "inputs": {
+        "reference": {
+          "$ref": "/endToEnd/reference/settleExtension/info"
+        },
+        "receiptDocument": {
+          "$ref": "/endToEnd/reference/document"
+        },
+        "directory": {
+          "$ref": "/endToEnd/directory"
+        },
+        "pinnedGovernanceKeys": {
+          "$ref": "/endToEnd/governanceKeys"
+        },
+        "now": {
+          "$ref": "/endToEnd/now"
+        },
+        "settle": {
+          "$ref": "/endToEnd/settle"
+        },
+        "requirements": {
+          "$ref": "/endToEnd/requirements"
+        },
+        "resourceUrl": {
+          "$ref": "/endToEnd/resourceUrl"
+        },
+        "method": "GET",
+        "responseBody": {
+          "$ref": "/endToEnd/body"
+        }
+      },
+      "levels": {
+        "integrity": "pass",
+        "authentic": "pass",
+        "trusted": "pass",
+        "settlement": "pass",
+        "delivery": "pass"
+      },
+      "valid": true,
+      "longTermEvidence": true,
+      "reason": null
+    },
+    {
+      "id": "endToEnd/stream/session",
+      "vector": "/endToEnd/stream",
+      "path": "session",
+      "offline": false,
+      "inputs": {
+        "eventStream": {
+          "$ref": "/endToEnd/stream/eventStream"
+        },
+        "directory": {
+          "$ref": "/endToEnd/directory"
+        },
+        "pinnedGovernanceKeys": {
+          "$ref": "/endToEnd/governanceKeys"
+        },
+        "now": {
+          "$ref": "/endToEnd/now"
+        },
+        "settle": {
+          "$ref": "/endToEnd/settle"
+        },
+        "requirements": {
+          "$ref": "/endToEnd/requirements"
+        },
+        "resourceUrl": {
+          "$ref": "/endToEnd/stream/resourceUrl"
+        },
+        "method": "GET"
+      },
+      "levels": {
+        "integrity": "pass",
+        "authentic": "pass",
+        "trusted": "pass",
+        "settlement": "pass",
+        "delivery": "pass"
+      },
+      "valid": true,
+      "longTermEvidence": false,
+      "reason": null
+    },
+    {
+      "id": "endToEnd/stream/archival",
+      "vector": "/endToEnd/stream",
+      "path": "archival",
+      "offline": false,
+      "inputs": {
+        "eventStream": {
+          "$ref": "/endToEnd/stream/eventStream"
+        },
+        "directory": {
+          "$ref": "/endToEnd/directory"
+        },
+        "pinnedGovernanceKeys": {
+          "$ref": "/endToEnd/governanceKeys"
+        },
+        "now": {
+          "$ref": "/endToEnd/now"
+        },
+        "settle": {
+          "$ref": "/endToEnd/settle"
+        },
+        "requirements": {
+          "$ref": "/endToEnd/requirements"
+        },
+        "resourceUrl": {
+          "$ref": "/endToEnd/stream/resourceUrl"
+        },
+        "method": "GET"
+      },
+      "levels": {
+        "integrity": "pass",
+        "authentic": "pass",
+        "trusted": "pass",
+        "settlement": "pass",
+        "delivery": "pass"
+      },
+      "valid": true,
+      "longTermEvidence": true,
+      "reason": null
+    },
+    {
+      "id": "streamSession/session",
+      "vector": "/streamSession",
+      "path": "session",
+      "offline": false,
+      "inputs": {
+        "eventStream": {
+          "$ref": "/streamSession/eventStream"
+        },
+        "reference": {
+          "$ref": "/streamSession/terminal/reference"
+        },
+        "receiptDocument": {
+          "$ref": "/streamSession/receiptDocument"
+        },
+        "directory": {
+          "$ref": "/endToEnd/directory"
+        },
+        "pinnedGovernanceKeys": {
+          "$ref": "/endToEnd/governanceKeys"
+        },
+        "now": {
+          "$ref": "/streamSession/now"
+        },
+        "settle": {
+          "$ref": "/streamSession/settle"
+        },
+        "requirements": {
+          "$ref": "/streamSession/requirements"
+        },
+        "resourceUrl": {
+          "$ref": "/streamSession/resourceUrl"
+        },
+        "method": {
+          "$ref": "/streamSession/method"
+        },
+        "responseStatus": 200
+      },
+      "levels": {
+        "integrity": "pass",
+        "authentic": "pass",
+        "trusted": "pass",
+        "settlement": "pass",
+        "delivery": "pass"
+      },
+      "valid": true,
+      "longTermEvidence": false,
+      "reason": null
+    },
+    {
+      "id": "streamSession/archival",
+      "vector": "/streamSession",
+      "path": "archival",
+      "offline": false,
+      "inputs": {
+        "eventStream": {
+          "$ref": "/streamSession/eventStream"
+        },
+        "reference": {
+          "$ref": "/streamSession/terminal/reference"
+        },
+        "receiptDocument": {
+          "$ref": "/streamSession/receiptDocument"
+        },
+        "directory": {
+          "$ref": "/endToEnd/directory"
+        },
+        "pinnedGovernanceKeys": {
+          "$ref": "/endToEnd/governanceKeys"
+        },
+        "now": {
+          "$ref": "/streamSession/now"
+        },
+        "settle": {
+          "$ref": "/streamSession/settle"
+        },
+        "requirements": {
+          "$ref": "/streamSession/requirements"
+        },
+        "resourceUrl": {
+          "$ref": "/streamSession/resourceUrl"
+        },
+        "method": {
+          "$ref": "/streamSession/method"
+        },
+        "responseStatus": 200
+      },
+      "levels": {
+        "integrity": "pass",
+        "authentic": "pass",
+        "trusted": "pass",
+        "settlement": "pass",
+        "delivery": "pass"
+      },
+      "valid": true,
+      "longTermEvidence": true,
+      "reason": null
+    }
+  ]
 }

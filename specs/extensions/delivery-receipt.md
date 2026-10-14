@@ -948,6 +948,30 @@ Sorting matters only when an issuer serves the arrays in another order; a direct
 gives the same root with or without the sort, so test with the reversed row above. This appendix is informative: the
 normative construction is the `root` row of §7.2.
 
+### A.7 Expected verdicts in the vectors file
+
+The fixtures of `delivery-receipt.vectors.json` are data; what a verifier must conclude from them is stated
+separately, in the top-level member `expectedVerdicts`, so that adding an expectation never changes a fixture. Each
+entry is one verifier run:
+
+| Member | Meaning |
+|---|---|
+| `id` | Unique name of the run. |
+| `vector` | JSON Pointer (RFC 6901) to the fixture the run is about. |
+| `path` | `session` or `archival` (§8.1). |
+| `offline` | `true` only for an explicitly requested third-party evaluation (§8.1). |
+| `inputs` | What the verifier is given, by role: `receipt`, or `reference` + `receiptDocument` (the octets served at `receiptUrl`), or `eventStream`; `directory`; `pinnedGovernanceKeys` (trust basis `pinned`, §7.3); `now`; and what the client observed: `settle`, `requirements`, `resourceUrl`, `method`, `responseBody`, `responseStatus`. A role that is absent was not available to the verifier. A value of the form `{ "$ref": "<JSON Pointer>" }` refers to a value elsewhere in the file; any other value is literal. |
+| `levels` | The result of each of the five levels of §8.1 — `integrity`, `authentic`, `trusted`, `settlement`, `delivery` — as `"pass"`, `"fail"` or `"not-evaluated"`. |
+| `valid` | The single "valid for the client" verdict of §8.1. |
+| `longTermEvidence` | Whether the result is long-term evidence (§8.1). |
+| `reason` | `null` when `valid` is `true`; otherwise `{ "level", "code" }`: the first level that did not pass and why. |
+
+A verifier conforms on a run when it reports the same `path`, the same value for each of the five levels, and the
+same `valid` and `longTermEvidence`. `reason.level` is part of the expectation; `reason.code` is compared only for
+codes this specification defines (`KEY_DIRECTORY_DIGEST_MISMATCH`, §7.5 step 2, and `DELIVERY_UNCONFIRMED`: the
+`delivery` level was not evaluated because the client holds no observed content to compare). Other codes in the
+file are diagnostics of the reference implementation. This convention restates §8.1 and adds no requirement to it.
+
 ## Appendix B. End-to-end vector
 
 [`delivery-receipt.vectors.json`](./delivery-receipt.vectors.json) contains, besides the vectors above:
@@ -964,3 +988,5 @@ normative construction is the `root` row of §7.2.
   stream, the events an `EventSource` dispatches, the frames, `frameCount`, `digest`, the terminal event, the receipt
   document, and the `recipe` (frames, event names, ids and raw lines in order) from which a writer reproduces the
   stream byte for byte. The data is synthetic; keys and directory are those of `endToEnd`.
+- `expectedVerdicts`: the expected result of each verifier run over the fixtures above, in the convention of A.7 —
+  `endToEnd` (body, by reference and SSE) and `streamSession`, each on both paths, all five levels passing.

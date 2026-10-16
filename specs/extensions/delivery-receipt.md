@@ -607,22 +607,31 @@ mismatch, not a reason to skip the comparison.
 Receipts are issued after settlement, so a failed or missing receipt cannot undo a payment. A client that required
 a receipt and did not get a valid one SHOULD record the failure (with the `SettleResponse`, and for streams the
 frames received) as evidence for dispute resolution, and MAY stop using the server. It MUST NOT retry the payment
-automatically.
+automatically. Missing, unconfirmed or no-longer-recoverable output is never by itself a reason to pay again: no
+second payment follows automatically from any of the outcomes below, and a new payment is a new request the client
+authorizes explicitly.
 
 Four outcomes are distinct, and a client keeps them separate (informative):
 
 - **receipt validity** — the `integrity`, `authentic` and `trusted` levels: the issuer's authorized key signed this
   receipt;
-- **receipt availability** — the client holds, or can still fetch, octets that match `digest` (§5.5). The 30-day
-  retention of §5.5 is about availability of the receipt, not of the result;
-- **result recoverability** — the issuer can still serve the output again. This is the issuer's operational policy;
-  no signature covers it and no level depends on it;
+- **receipt availability** — the verifier holds octets that match `digest` (§5.5). A matching copy in the verifier's
+  hands establishes only that the verifier has it; it says nothing about whether `receiptUrl` is retrievable from the
+  issuer's origin today. Origin availability stays unevaluated unless there is an actual retrieval observation (a
+  fetch of `receiptUrl` at a recorded time). The 30-day retention of §5.5 is about availability of the receipt, not of
+  the result;
+- **result recoverability** — whether the issuer can still serve the output again. This is the issuer's operational
+  policy; no signature covers it and no level depends on it. Comparing the current time `now` with a declared recovery
+  deadline `until` establishes only window eligibility: the window is open when `now < until` and closed when
+  `now >= until` (the deadline instant itself is outside the window). An open window does not show that the issuer
+  still holds a retrievable result; only an actual retrieval observation does;
 - **buyer-observed output** — what the client actually captured. It is the only input to `delivery`.
 
-A valid, available receipt with no captured output, after the issuer's recovery window has closed, leaves `delivery`
-not evaluated ("delivery unconfirmed"): `valid` is false and the rule above applies, so the payment is not retried
-automatically. A response the client saved stays verifiable against the receipt after the issuer stops serving it.
-Appendix B, `deliveryUnconfirmed`, gives both cases as vectors.
+A valid receipt held by the client with no captured output leaves `delivery` not evaluated ("delivery unconfirmed"):
+`valid` is false and the rule above applies, so the payment is not retried automatically, whether the recovery
+window is still open or has closed. A response the client saved stays verifiable against the receipt after the
+issuer stops serving it. Appendix B, `deliveryUnconfirmed`, gives these cases, and both sides of the deadline, as
+vectors.
 
 ## 9. Example (x402 v2, HTTP, body mode)
 
@@ -980,8 +989,8 @@ entry is one verifier run:
 | `valid` | The single "valid for the client" verdict of §8.1. |
 | `longTermEvidence` | Whether the result is long-term evidence (§8.1). |
 | `reason` | `null` when `valid` is `true`; otherwise `{ "level", "code" }`: the first level that did not pass and why. |
-| `outcomes` | Optional. The four outcomes of §8.4: `receiptValidity` (`valid` when `integrity`, `authentic` and `trusted` pass), `receiptAvailability` (`available` when `receiptDocument` hashes to the reference `digest`), `resultRecoverability` (`expired` when `now` is after the fixture's `recoveryWindow.until`, otherwise `recoverable`) and `buyerObservedOutput` (`captured` when `inputs` has `responseBody` or `eventStream`, otherwise `none`). Each is computable from the file. |
-| `automaticRepayment` | Optional. Always `false`: §8.4 forbids retrying the payment automatically. |
+| `outcomes` | Optional. The four outcomes of §8.4: `receiptValidity` (`valid` when `integrity`, `authentic` and `trusted` pass); `receiptAvailability` (`receiptAvailableToVerifier` when `receiptDocument` hashes to the reference `digest` — the verifier holds a matching copy; availability at the issuer's origin is not evaluated, since no run has a retrieval observation); `resultRecoverability` (`window-open` when `now < recoveryWindow.until`, `expired` when `now >= recoveryWindow.until`; the value `recoverable` is reserved for a run whose inputs record an actual retrieval of the result from the issuer, and no run in this file has one); and `buyerObservedOutput` (`captured` when `inputs` has `responseBody` or `eventStream`, otherwise `none`). Each is computable from the file. |
+| `automaticRepayment` | Optional. Always `false`: §8.4 forbids retrying the payment automatically, and missing output never triggers a second payment. |
 
 A verifier conforms on a run when it reports the same `path`, the same value for each of the five levels, and the
 same `valid` and `longTermEvidence`. `reason.level` is part of the expectation; `reason.code` is compared only for
@@ -1011,5 +1020,8 @@ file are diagnostics of the reference implementation. This convention restates �
   `SettleResponse` and requirements, but no response body, and verifies at `now`, one hour after the issuer's
   24-hour `recoveryWindow` closed (synthetic values). Expected, on both paths: `integrity`, `authentic`, `trusted` and
   `settlement` pass, `delivery` is not evaluated, `valid` is false with reason `DELIVERY_UNCONFIRMED`, no automatic
-  repayment; outcomes `valid` / `available` / `expired` / `none`. A companion run with the body the buyer saved passes
-  all five levels at the same `now`: recoverability and observed output are independent.
+  repayment; outcomes `valid` / `receiptAvailableToVerifier` / `expired` / `none`. A companion run with the body the
+  buyer saved passes all five levels at the same `now`: recoverability and observed output are independent. Two
+  boundary runs (session path, no output, `now` given literally) fix the deadline: at `now = until - 1` the outcome
+  is `window-open`, at `now = until` it is `expired`; the levels, `valid`, `reason` and `automaticRepayment` are the
+  same on both sides.

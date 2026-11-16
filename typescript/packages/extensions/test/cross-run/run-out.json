@@ -1,0 +1,998 @@
+{
+  "control": {
+    "runs": 14,
+    "strict": 10,
+    "decisive": 10
+  },
+  "proposed": {
+    "runs": 11,
+    "strict": 5,
+    "decisive": 11
+  },
+  "controlRuns": [
+    {
+      "id": "endToEnd/body/session",
+      "path": "session",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": true,
+        "longTermEvidence": false,
+        "reason": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        }
+      },
+      "got": {
+        "valid": true,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "endToEnd/body/archival",
+      "path": "archival",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": true,
+        "longTermEvidence": true,
+        "reason": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        }
+      },
+      "got": {
+        "valid": true,
+        "longTermEvidence": true,
+        "firstNonPassingLevel": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": []
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "endToEnd/reference/session",
+      "path": "session",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": true,
+        "longTermEvidence": false,
+        "reason": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        }
+      },
+      "got": {
+        "valid": true,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "endToEnd/reference/archival",
+      "path": "archival",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": true,
+        "longTermEvidence": true,
+        "reason": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        }
+      },
+      "got": {
+        "valid": true,
+        "longTermEvidence": true,
+        "firstNonPassingLevel": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": []
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "endToEnd/stream/session",
+      "path": "session",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": true,
+        "longTermEvidence": false,
+        "reason": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        }
+      },
+      "got": {
+        "valid": true,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "endToEnd/stream/archival",
+      "path": "archival",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": true,
+        "longTermEvidence": true,
+        "reason": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        }
+      },
+      "got": {
+        "valid": true,
+        "longTermEvidence": true,
+        "firstNonPassingLevel": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": []
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "streamSession/session",
+      "path": "session",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": true,
+        "longTermEvidence": false,
+        "reason": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        }
+      },
+      "got": {
+        "valid": true,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "streamSession/archival",
+      "path": "archival",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": true,
+        "longTermEvidence": true,
+        "reason": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        }
+      },
+      "got": {
+        "valid": true,
+        "longTermEvidence": true,
+        "firstNonPassingLevel": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": []
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "deliveryUnconfirmed/no-output/session",
+      "path": "session",
+      "strict": false,
+      "decisive": false,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": false,
+        "reason": {
+          "level": "delivery",
+          "code": "DELIVERY_UNCONFIRMED"
+        },
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "not-evaluated"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": "delivery",
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "not-evaluated"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [],
+      "codeCompared": true,
+      "codeOk": false
+    },
+    {
+      "id": "deliveryUnconfirmed/no-output/archival",
+      "path": "archival",
+      "strict": false,
+      "decisive": false,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": true,
+        "reason": {
+          "level": "delivery",
+          "code": "DELIVERY_UNCONFIRMED"
+        },
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "not-evaluated"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": true,
+        "firstNonPassingLevel": "delivery",
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "not-evaluated"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": []
+      },
+      "levelDiff": [],
+      "codeCompared": true,
+      "codeOk": false
+    },
+    {
+      "id": "deliveryUnconfirmed/saved-output/session",
+      "path": "session",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": true,
+        "longTermEvidence": false,
+        "reason": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        }
+      },
+      "got": {
+        "valid": true,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "deliveryUnconfirmed/saved-output/archival",
+      "path": "archival",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": true,
+        "longTermEvidence": true,
+        "reason": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        }
+      },
+      "got": {
+        "valid": true,
+        "longTermEvidence": true,
+        "firstNonPassingLevel": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": []
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "deliveryUnconfirmed/boundary/window-open/session",
+      "path": "session",
+      "strict": false,
+      "decisive": false,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": false,
+        "reason": {
+          "level": "delivery",
+          "code": "DELIVERY_UNCONFIRMED"
+        },
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "not-evaluated"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": "delivery",
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "not-evaluated"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [],
+      "codeCompared": true,
+      "codeOk": false
+    },
+    {
+      "id": "deliveryUnconfirmed/boundary/at-deadline/session",
+      "path": "session",
+      "strict": false,
+      "decisive": false,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": false,
+        "reason": {
+          "level": "delivery",
+          "code": "DELIVERY_UNCONFIRMED"
+        },
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "not-evaluated"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": "delivery",
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "not-evaluated"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [],
+      "codeCompared": true,
+      "codeOk": false
+    }
+  ],
+  "proposedRuns": [
+    {
+      "id": "keyDirectoryDigestMismatch/session",
+      "path": "session",
+      "strict": false,
+      "decisive": true,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": false,
+        "reason": {
+          "level": "trusted",
+          "code": "KEY_DIRECTORY_DIGEST_MISMATCH"
+        },
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "fail",
+          "settlement": "not-evaluated",
+          "delivery": "not-evaluated"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": "trusted",
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "fail",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [
+          "trusted:KEY_DIRECTORY_DIGEST_MISMATCH"
+        ],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [
+        "settlement: expected not-evaluated, got pass",
+        "delivery: expected not-evaluated, got pass"
+      ],
+      "codeCompared": true,
+      "codeOk": true
+    },
+    {
+      "id": "keyDirectoryDigestMismatch/archival",
+      "path": "archival",
+      "strict": false,
+      "decisive": true,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": false,
+        "reason": {
+          "level": "trusted",
+          "code": "KEY_DIRECTORY_DIGEST_MISMATCH"
+        },
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "fail",
+          "settlement": "not-evaluated",
+          "delivery": "not-evaluated"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": "trusted",
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "fail",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [
+          "trusted:KEY_DIRECTORY_DIGEST_MISMATCH"
+        ],
+        "unverifiedAlgorithms": []
+      },
+      "levelDiff": [
+        "settlement: expected not-evaluated, got pass",
+        "delivery: expected not-evaluated, got pass"
+      ],
+      "codeCompared": true,
+      "codeOk": true
+    },
+    {
+      "id": "amountInflatedResigned/session",
+      "path": "session",
+      "strict": false,
+      "decisive": true,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": false,
+        "reason": {
+          "level": "settlement",
+          "code": "SETTLEMENT_MISMATCH"
+        },
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "fail",
+          "delivery": "not-evaluated"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": "settlement",
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "fail",
+          "delivery": "pass"
+        },
+        "reasons": [
+          "settlement:SETTLEMENT_MISMATCH"
+        ],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [
+        "delivery: expected not-evaluated, got pass"
+      ],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "amountInflatedResigned/archival",
+      "path": "archival",
+      "strict": false,
+      "decisive": true,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": true,
+        "reason": {
+          "level": "settlement",
+          "code": "SETTLEMENT_MISMATCH"
+        },
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "fail",
+          "delivery": "not-evaluated"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": true,
+        "firstNonPassingLevel": "settlement",
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "fail",
+          "delivery": "pass"
+        },
+        "reasons": [
+          "settlement:SETTLEMENT_MISMATCH"
+        ],
+        "unverifiedAlgorithms": []
+      },
+      "levelDiff": [
+        "delivery: expected not-evaluated, got pass"
+      ],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "mlDsa65Stripped/session",
+      "path": "session",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": false,
+        "reason": {
+          "level": "integrity",
+          "code": "SIGNATURES_SHAPE"
+        },
+        "levels": {
+          "integrity": "fail",
+          "authentic": "not-evaluated",
+          "trusted": "not-evaluated",
+          "settlement": "not-evaluated",
+          "delivery": "not-evaluated"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": "integrity",
+        "levels": {
+          "integrity": "fail",
+          "authentic": "not-evaluated",
+          "trusted": "not-evaluated",
+          "settlement": "not-evaluated",
+          "delivery": "not-evaluated"
+        },
+        "reasons": [
+          "integrity:SIGNATURES_SHAPE"
+        ],
+        "unverifiedAlgorithms": []
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "mlDsa65Stripped/archival",
+      "path": "archival",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": false,
+        "reason": {
+          "level": "integrity",
+          "code": "SIGNATURES_SHAPE"
+        },
+        "levels": {
+          "integrity": "fail",
+          "authentic": "not-evaluated",
+          "trusted": "not-evaluated",
+          "settlement": "not-evaluated",
+          "delivery": "not-evaluated"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": "integrity",
+        "levels": {
+          "integrity": "fail",
+          "authentic": "not-evaluated",
+          "trusted": "not-evaluated",
+          "settlement": "not-evaluated",
+          "delivery": "not-evaluated"
+        },
+        "reasons": [
+          "integrity:SIGNATURES_SHAPE"
+        ],
+        "unverifiedAlgorithms": []
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "splitVerdict/session",
+      "path": "session",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": true,
+        "longTermEvidence": false,
+        "reason": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        }
+      },
+      "got": {
+        "valid": true,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": null,
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "splitVerdict/archival",
+      "path": "archival",
+      "strict": false,
+      "decisive": true,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": false,
+        "reason": {
+          "level": "authentic",
+          "code": "SIGNATURE_INVALID"
+        },
+        "levels": {
+          "integrity": "pass",
+          "authentic": "fail",
+          "trusted": "not-evaluated",
+          "settlement": "not-evaluated",
+          "delivery": "not-evaluated"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": "authentic",
+        "levels": {
+          "integrity": "pass",
+          "authentic": "fail",
+          "trusted": "fail",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [
+          "authentic:SIGNATURE_INVALID"
+        ],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [
+        "trusted: expected not-evaluated, got fail",
+        "settlement: expected not-evaluated, got pass",
+        "delivery: expected not-evaluated, got pass"
+      ],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "issuedInFuture/session",
+      "path": "session",
+      "strict": false,
+      "decisive": true,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": false,
+        "reason": {
+          "level": "trusted",
+          "code": "ISSUED_IN_FUTURE"
+        },
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "fail",
+          "settlement": "not-evaluated",
+          "delivery": "not-evaluated"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": "trusted",
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "fail",
+          "settlement": "pass",
+          "delivery": "pass"
+        },
+        "reasons": [
+          "trusted:ISSUED_AT_IN_FUTURE"
+        ],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [
+        "settlement: expected not-evaluated, got pass",
+        "delivery: expected not-evaluated, got pass"
+      ],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "framingUnregistered/session",
+      "path": "session",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": false,
+        "reason": {
+          "level": "integrity",
+          "code": "DELIVERY_FRAMING"
+        },
+        "levels": {
+          "integrity": "fail",
+          "authentic": "not-evaluated",
+          "trusted": "not-evaluated",
+          "settlement": "not-evaluated",
+          "delivery": "not-evaluated"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": "integrity",
+        "levels": {
+          "integrity": "fail",
+          "authentic": "not-evaluated",
+          "trusted": "not-evaluated",
+          "settlement": "not-evaluated",
+          "delivery": "not-evaluated"
+        },
+        "reasons": [
+          "integrity:PAYLOAD_FIELD_delivery"
+        ],
+        "unverifiedAlgorithms": []
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    },
+    {
+      "id": "eventAfterTerminal/session",
+      "path": "session",
+      "strict": true,
+      "decisive": true,
+      "expected": {
+        "valid": false,
+        "longTermEvidence": false,
+        "reason": {
+          "level": "delivery",
+          "code": "EVENTS_AFTER_TERMINAL"
+        },
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "fail"
+        }
+      },
+      "got": {
+        "valid": false,
+        "longTermEvidence": false,
+        "firstNonPassingLevel": "delivery",
+        "levels": {
+          "integrity": "pass",
+          "authentic": "pass",
+          "trusted": "pass",
+          "settlement": "pass",
+          "delivery": "fail"
+        },
+        "reasons": [
+          "delivery:STREAM_EVENTS_AFTER_TRAILER"
+        ],
+        "unverifiedAlgorithms": [
+          "ml-dsa-65"
+        ]
+      },
+      "levelDiff": [],
+      "codeCompared": false,
+      "codeOk": true
+    }
+  ]
+}

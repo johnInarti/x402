@@ -822,7 +822,8 @@ re-signing if your ML-DSA signer is hedged.
 
 This specification PR carries only the text and `delivery-receipt.vectors.json`. The TypeScript reference
 implementation, its test suite and the OpenSSL-only check referenced below are proposed in a follow-up PR; until
-then they are public at `johnInarti/x402`, branch `feat/delivery-receipt-extension` (commit `3cce288`).
+then they are public at `johnInarti/x402`, branch `feat/delivery-receipt-extension` (commit `9e184e0`, whose
+`test/delivery-receipt-expected-verdicts.test.ts` checks every run of `expectedVerdicts` under the rule of A.7).
 
 **Which runtime checked what.** "The vectors pass" means different things per row, so each check is listed with
 the runtime that performed it:
@@ -998,11 +999,12 @@ entry is one verifier run:
 
 A verifier conforms on a run when it reports the same `path`, the same value for each level listed in `levels`, and
 the same `valid` and `longTermEvidence`. What a verifier reports for a level after the first one that did not pass is
-informative and is not compared: a verifier may stop there or go on evaluating, and the verdict is the same either way,
-because `valid` requires every level to pass (§8.1). `reason.level` is part of the expectation; `reason.code` is compared only for
-codes this specification defines (`KEY_DIRECTORY_DIGEST_MISMATCH`, §7.5 step 2, and `DELIVERY_UNCONFIRMED`: the
-`delivery` level was not evaluated because the client holds no observed content to compare). Other codes in the
-file are diagnostics of the reference implementation. This convention restates §8.1 and adds no requirement to it.
+informative and is not compared: a verifier may stop there or go on evaluating, and the verdict is the same either
+way, because `valid` requires every level to pass (§8.1). `reason.level` is part of the expectation; `reason.code` is
+compared only for codes this specification defines (`KEY_DIRECTORY_DIGEST_MISMATCH`, §7.5 step 2, and
+`DELIVERY_UNCONFIRMED`: the `delivery` level was not evaluated because the client holds no observed content to
+compare). Other codes in the file are diagnostics of the reference implementation. This convention restates §8.1
+and adds no requirement to it.
 
 ## Appendix B. End-to-end vector
 

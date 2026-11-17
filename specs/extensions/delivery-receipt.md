@@ -295,7 +295,10 @@ about that size.
 
 **Serving.** `GET receiptUrl` MUST return, without payment, `application/json` whose body is exactly the octets `D`.
 The resource is **immutable**: it MUST return the same octets for as long as it is served (servers SHOULD send
-`Cache-Control: public, max-age=31536000, immutable`), and servers SHOULD keep it retrievable for at least 30 days.
+`Cache-Control: private, no-store` by default; an issuer MAY opt in to public archival with
+`Cache-Control: public, max-age=31536000, immutable` and SHOULD state that choice in its documentation), and servers
+SHOULD keep it retrievable for at least 30 days. Immutability rests on `receiptId` addressing and `digest`, not on
+public cacheability.
 Because the URL is addressed by `receiptId` and the octets are fixed by `digest`, any static store or CDN can serve
 it.
 
@@ -560,6 +563,9 @@ separately:
 | `settlement` | The payload matches the settlement the client observed (§8.3), and any `offer-receipt` receipt in the same `SettleResponse` agrees with it (§2.1). |
 | `delivery` | The body digest (body mode), or the frame count, running digest and terminal event (stream mode), equal what the client received, and `responseStatus`, when not `null`, equals the observed status. |
 
+When the client did not record the response status, the comparison is not performed, and a verifier SHOULD report
+whether it was.
+
 A verifier MUST report which path it used. A receipt is **valid for the client** only if all five levels pass; a
 level that was not evaluated has not passed, and an implementation that exposes a single "valid" verdict MUST NOT
 return it as true when `settlement` or `delivery` was not evaluated, unless the caller explicitly asked for a
@@ -604,7 +610,31 @@ mismatch, not a reason to skip the comparison.
 Receipts are issued after settlement, so a failed or missing receipt cannot undo a payment. A client that required
 a receipt and did not get a valid one SHOULD record the failure (with the `SettleResponse`, and for streams the
 frames received) as evidence for dispute resolution, and MAY stop using the server. It MUST NOT retry the payment
-automatically.
+automatically. Missing, unconfirmed or no-longer-recoverable output is never by itself a reason to pay again: no
+second payment follows automatically from any of the outcomes below, and a new payment is a new request the client
+authorizes explicitly.
+
+Four outcomes are distinct, and a client keeps them separate (informative):
+
+- **receipt validity** — the `integrity`, `authentic` and `trusted` levels: the issuer's authorized key signed this
+  receipt;
+- **receipt availability** — the verifier holds octets that match `digest` (§5.5). A matching copy in the verifier's
+  hands establishes only that the verifier has it; it says nothing about whether `receiptUrl` is retrievable from the
+  issuer's origin today. Origin availability stays unevaluated unless there is an actual retrieval observation (a
+  fetch of `receiptUrl` at a recorded time). The 30-day retention of §5.5 is about availability of the receipt, not of
+  the result;
+- **result recoverability** — whether the issuer can still serve the output again. This is the issuer's operational
+  policy; no signature covers it and no level depends on it. Comparing the current time `now` with a declared recovery
+  deadline `until` establishes only window eligibility: the window is open when `now < until` and closed when
+  `now >= until` (the deadline instant itself is outside the window). An open window does not show that the issuer
+  still holds a retrievable result; only an actual retrieval observation does;
+- **buyer-observed output** — what the client actually captured. It is the only input to `delivery`.
+
+A valid receipt held by the client with no captured output leaves `delivery` not evaluated ("delivery unconfirmed"):
+`valid` is false and the rule above applies, so the payment is not retried automatically, whether the recovery
+window is still open or has closed. A response the client saved stays verifiable against the receipt after the
+issuer stops serving it. Appendix B, `deliveryUnconfirmed`, gives these cases, and both sides of the deadline, as
+vectors.
 
 ## 9. Example (x402 v2, HTTP, body mode)
 
@@ -742,6 +772,8 @@ framing registered for that transport. Implementations MUST document what they h
   contains the transaction, so it is not guessable, but clients and servers SHOULD treat the URL as confidential as
   the receipt itself. The `digest` binds the signatures as well as the payload, so a store or cache cannot swap a
   signature without detection; serving the octets `D` exactly is what makes `digest` checkable before parsing.
+  Origin deletion is not cache deletion: a receipt served with a public cache policy may outlive the origin's
+  retention, and an issuer MUST NOT describe origin deletion as revocation of the capability.
 - **Streams.** The SSE framing hashes event data only; `event` and `id` fields are not covered. A stream receipt is
   signed at the end of the stream, after settlement: a server can stop a stream early and sign the shorter stream,
   and the receipt then states what was delivered, not what was promised.
@@ -787,6 +819,10 @@ reference's structure, so agreement between the two shows that the vectors are r
 two independent designs agree. All values are exact. Keys are derived from the 32-octet `seed` (Ed25519: the seed is the RFC 8032 private
 key; ML-DSA: the seed is FIPS 204 `ξ`). Signatures were produced with deterministic signing; verify them rather than
 re-signing if your ML-DSA signer is hedged.
+
+This specification PR carries only the text and `delivery-receipt.vectors.json`. The TypeScript reference
+implementation, its test suite and the OpenSSL-only check referenced below are proposed in a follow-up PR; until
+then they are public at `johnInarti/x402`, branch `feat/delivery-receipt-extension` (commit `3cce288`).
 
 **Which runtime checked what.** "The vectors pass" means different things per row, so each check is listed with
 the runtime that performed it:
@@ -939,6 +975,35 @@ Sorting matters only when an issuer serves the arrays in another order; a direct
 gives the same root with or without the sort, so test with the reversed row above. This appendix is informative: the
 normative construction is the `root` row of §7.2.
 
+### A.7 Expected verdicts in the vectors file
+
+The fixtures of `delivery-receipt.vectors.json` are data; what a verifier must conclude from them is stated
+separately, in the top-level member `expectedVerdicts`, so that adding an expectation never changes a fixture. Each
+entry is one verifier run:
+
+| Member | Meaning |
+|---|---|
+| `id` | Unique name of the run. |
+| `vector` | JSON Pointer (RFC 6901) to the fixture the run is about. |
+| `path` | `session` or `archival` (§8.1). |
+| `offline` | `true` only for an explicitly requested third-party evaluation (§8.1). |
+| `inputs` | What the verifier is given, by role: `receipt`, or `reference` + `receiptDocument` (the octets served at `receiptUrl`), or `eventStream`; `directory`; `pinnedGovernanceKeys` (trust basis `pinned`, §7.3); `now`; and what the client observed: `settle`, `requirements`, `resourceUrl`, `method`, `responseBody`, `responseStatus`. A role that is absent was not available to the verifier. A value of the form `{ "$ref": "<JSON Pointer>" }` refers to a value elsewhere in the file; any other value is literal. |
+| `levels` | The result of the levels of §8.1, in the order `integrity`, `authentic`, `trusted`, `settlement`, `delivery`, as `"pass"`, `"fail"` or `"not-evaluated"`, up to and including the first level that did not pass. A level after it is not listed. |
+| `valid` | The single "valid for the client" verdict of §8.1. |
+| `longTermEvidence` | Whether the result is long-term evidence (§8.1). |
+| `reason` | `null` when `valid` is `true`; otherwise `{ "level", "code" }`: the first level that did not pass and why. |
+| `outcomes` | Optional. The four outcomes of §8.4: `receiptValidity` (`valid` when `integrity`, `authentic` and `trusted` pass); `receiptAvailability` (`receiptAvailableToVerifier` when `receiptDocument` hashes to the reference `digest` — the verifier holds a matching copy; availability at the issuer's origin is not evaluated, since no run has a retrieval observation); `resultRecoverability` (`window-open` when `now < recoveryWindow.until`, `expired` when `now >= recoveryWindow.until`; the value `recoverable` is reserved for a run whose inputs record an actual retrieval of the result from the issuer, and no run in this file has one); and `buyerObservedOutput` (`captured` when `inputs` has `responseBody` or `eventStream`, otherwise `none`). Each is computable from the file. |
+| `automaticRepayment` | Optional. Always `false`: §8.4 forbids retrying the payment automatically, and missing output never triggers a second payment. |
+| `note` | Optional. Informative remark on the run; never part of the expectation. |
+
+A verifier conforms on a run when it reports the same `path`, the same value for each level listed in `levels`, and
+the same `valid` and `longTermEvidence`. What a verifier reports for a level after the first one that did not pass is
+informative and is not compared: a verifier may stop there or go on evaluating, and the verdict is the same either way,
+because `valid` requires every level to pass (§8.1). `reason.level` is part of the expectation; `reason.code` is compared only for
+codes this specification defines (`KEY_DIRECTORY_DIGEST_MISMATCH`, §7.5 step 2, and `DELIVERY_UNCONFIRMED`: the
+`delivery` level was not evaluated because the client holds no observed content to compare). Other codes in the
+file are diagnostics of the reference implementation. This convention restates §8.1 and adds no requirement to it.
+
 ## Appendix B. End-to-end vector
 
 [`delivery-receipt.vectors.json`](./delivery-receipt.vectors.json) contains, besides the vectors above:
@@ -955,3 +1020,24 @@ normative construction is the `root` row of §7.2.
   stream, the events an `EventSource` dispatches, the frames, `frameCount`, `digest`, the terminal event, the receipt
   document, and the `recipe` (frames, event names, ids and raw lines in order) from which a writer reproduces the
   stream byte for byte. The data is synthetic; keys and directory are those of `endToEnd`.
+- `expectedVerdicts`: the expected result of each verifier run over the fixtures above, in the convention of A.7 —
+  `endToEnd` (body, by reference and SSE) and `streamSession`, each on both paths, all five levels passing.
+- `deliveryUnconfirmed`: the negative fixture of §8.4. The buyer holds the `endToEnd` receipt document, directory,
+  `SettleResponse` and requirements, but no response body, and verifies at `now`, one hour after the issuer's
+  24-hour `recoveryWindow` closed (synthetic values). Expected, on both paths: `integrity`, `authentic`, `trusted` and
+  `settlement` pass, `delivery` is not evaluated, `valid` is false with reason `DELIVERY_UNCONFIRMED`, no automatic
+  repayment; outcomes `valid` / `receiptAvailableToVerifier` / `expired` / `none`. A companion run with the body the
+  buyer saved passes all five levels at the same `now`: recoverability and observed output are independent. Two
+  boundary runs (session path, no output, `now` given literally) fix the deadline: at `now = until - 1` the outcome
+  is `window-open`, at `now = until` it is `expired`; the levels, `valid`, `reason` and `automaticRepayment` are the
+  same on both sides.
+- `negative`: seven negative fixtures contributed by Tetsuroh Hori (@Tetsurohhori) in x402-foundation/x402#3758, each
+  derived from `endToEnd` and, where the payload changed, re-signed with the published test seeds, with eleven runs
+  in `expectedVerdicts`. They pin a directory root that does not match `keyDirectoryDigest` (`trusted`,
+  `KEY_DIRECTORY_DIGEST_MISMATCH`, both paths); an inflated amount that passes every check a third party can make and
+  is caught only by the client's own settlement observation (§8.3, §12); a receipt without its `ml-dsa-65` entry
+  (`integrity` on both paths, §6.1); a broken `ml-dsa-65` signature next to a valid `ed25519` one (valid on the
+  session path with `ml-dsa-65` reported as not checked, `authentic` fails on the archival path, §6.1); an `issuedAt`
+  beyond the allowed skew (`trusted`, §7.4); an unregistered stream framing (`integrity`, §5.6); and an event after
+  the terminal event (`delivery`, §5.6). They were decided by two implementations written separately: the verifier
+  that generated them, written from this text without the reference's code, and the reference.

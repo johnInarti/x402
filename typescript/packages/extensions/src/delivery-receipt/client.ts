@@ -434,6 +434,7 @@ async function deliveryMismatches(
  * @param levels - Levels to update
  * @param reasons - Reasons to append to
  * @param done - Builds the verdict
+ * @param offline - True for an explicitly requested third-party evaluation (§8.1)
  * @returns The verdict
  */
 async function evaluateBindings(
@@ -442,6 +443,7 @@ async function evaluateBindings(
   levels: ReceiptVerificationLevels,
   reasons: ReceiptVerificationResult["reasons"],
   done: () => ReceiptVerificationResult,
+  offline: boolean,
 ): Promise<ReceiptVerificationResult> {
   const mism = settlementMismatches(payload, e);
   if (mism) {
@@ -458,6 +460,11 @@ async function evaluateBindings(
   if (codes) {
     levels.delivery = codes.length === 0;
     for (const code of codes) reasons.push({ level: "delivery", code });
+  } else if (!offline) {
+    // §8.4 / A.7: the client holds no observed content, so delivery cannot be confirmed. The level
+    // stays unevaluated (it is not a mismatch), but the verdict says why it did not pass. An
+    // offline third-party evaluation asked not to have it, so no reason is reported there.
+    reasons.push({ level: "delivery", code: "DELIVERY_UNCONFIRMED" });
   }
   return done();
 }
@@ -609,7 +616,14 @@ export async function verifyDeliveryReceipt(
           ? { level: "authentic", code: "KEY_NOT_LISTED", detail: sigEntry.kid }
           : { level: "trusted", code: chain.code ?? "DIRECTORY_INVALID", detail: chain.detail },
       );
-      return await evaluateBindings(payload, options.expected ?? {}, levels, reasons, done);
+      return await evaluateBindings(
+        payload,
+        options.expected ?? {},
+        levels,
+        reasons,
+        done,
+        options.offline === true,
+      );
     }
 
     // ── authentic ──
@@ -679,7 +693,14 @@ export async function verifyDeliveryReceipt(
       });
     }
     levels.trusted = levels.authentic && trustCodes.length === 0;
-    return await evaluateBindings(payload, options.expected ?? {}, levels, reasons, done);
+    return await evaluateBindings(
+      payload,
+      options.expected ?? {},
+      levels,
+      reasons,
+      done,
+      options.offline === true,
+    );
   } catch (error) {
     reasons.push({
       level: "integrity",

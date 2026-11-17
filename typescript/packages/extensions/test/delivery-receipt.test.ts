@@ -991,8 +991,13 @@ describe("delivery-receipt: composition with offer-receipt", () => {
         expected: { settle, offerReceipt: facts },
         now: NOW,
       });
-      expect(v.reasons, String(includeTxHash)).toEqual([]);
+      // No body is given here: settlement is what this test is about, and delivery stays
+      // unconfirmed, which the verdict reports (§8.4).
+      expect(v.reasons, String(includeTxHash)).toEqual([
+        { level: "delivery", code: "DELIVERY_UNCONFIRMED" },
+      ]);
       expect(v.levels.settlement).toBe(true);
+      expect(v.levels.delivery).toBeNull();
     }
   });
 
